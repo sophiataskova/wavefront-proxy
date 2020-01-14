@@ -38,9 +38,14 @@
       <version>1.72</version>
     </dependency>
     <dependency>
-      <groupId>com.squareup.tape2</groupId>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+      <version>2.2.2</version>
+    </dependency>
+    <dependency>
+      <groupId>com.squareup</groupId>
       <artifactId>tape</artifactId>
-      <version>2.0.0-beta1</version>
+      <version>1.2.3</version>
     </dependency>
     <dependency>
       <groupId>io.jaegertracing</groupId>

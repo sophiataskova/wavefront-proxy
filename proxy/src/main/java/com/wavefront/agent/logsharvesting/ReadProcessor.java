@@ -14,17 +14,17 @@ import com.yammer.metrics.core.WavefrontHistogram;
  */
 public class ReadProcessor implements MetricProcessor<ReadProcessorContext> {
   @Override
-  public void processMeter(MetricName name, Metered meter, ReadProcessorContext context) {
+  public void processMeter(MetricName name, Metered meter, ReadProcessorContext context) throws Exception {
     throw new UnsupportedOperationException();
   }
 
   @Override
-  public void processCounter(MetricName name, Counter counter, ReadProcessorContext context) {
+  public void processCounter(MetricName name, Counter counter, ReadProcessorContext context) throws Exception {
     counter.inc(context.getValue() == null ? 1L : Math.round(context.getValue()));
   }
 
   @Override
-  public void processHistogram(MetricName name, Histogram histogram, ReadProcessorContext context) {
+  public void processHistogram(MetricName name, Histogram histogram, ReadProcessorContext context) throws Exception {
     if (histogram instanceof WavefrontHistogram) {
       ((WavefrontHistogram) histogram).update(context.getValue());
     } else {
@@ -33,7 +33,7 @@ public class ReadProcessor implements MetricProcessor<ReadProcessorContext> {
   }
 
   @Override
-  public void processTimer(MetricName name, Timer timer, ReadProcessorContext context) {
+  public void processTimer(MetricName name, Timer timer, ReadProcessorContext context) throws Exception {
     throw new UnsupportedOperationException();
   }
 

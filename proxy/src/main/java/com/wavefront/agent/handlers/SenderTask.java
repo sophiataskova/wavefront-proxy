@@ -1,9 +1,6 @@
 package com.wavefront.agent.handlers;
 
-import com.wavefront.agent.data.QueueingReason;
-import com.wavefront.common.Managed;
-
-import javax.annotation.Nullable;
+import java.util.concurrent.ExecutorService;
 
 /**
  * Batch and ship valid items to Wavefront servers
@@ -12,7 +9,7 @@ import javax.annotation.Nullable;
  *
  * @param <T> the type of input objects handled.
  */
-public interface SenderTask<T> extends Managed {
+public interface SenderTask<T> {
 
   /**
    * Add valid item to the send queue (memory buffers).
@@ -22,8 +19,19 @@ public interface SenderTask<T> extends Managed {
   void add(T item);
 
   /**
-   * Calculate a numeric score (the lower the better) that is intended to help the
-   * {@link ReportableEntityHandler} choose the best SenderTask to handle over data to.
+   * Add multiple valid items to the send queue (memory buffers).
+   *
+   * @param items items to add to the send queue.
+   */
+  default void add(Iterable<T> items) {
+    for (T item : items) {
+      add(item);
+    }
+  }
+
+  /**
+   * Calculate a numeric score (the lower the better) that is intended to help the {@link ReportableEntityHandler}
+   * to choose the best SenderTask to handle over data to.
    *
    * @return task score
    */
@@ -31,8 +39,13 @@ public interface SenderTask<T> extends Managed {
 
   /**
    * Force memory buffer flush.
-   *
-   * @param reason reason for queueing.
    */
-  void drainBuffersToQueue(@Nullable QueueingReason reason);
+  void drainBuffersToQueue();
+
+  /**
+   * Shut down the scheduler for this task (prevent future scheduled runs).
+   *
+   * @return executor service that is shutting down.
+   */
+  ExecutorService shutdown();
 }

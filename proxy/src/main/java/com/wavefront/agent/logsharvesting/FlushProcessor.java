@@ -56,12 +56,12 @@ public class FlushProcessor implements MetricProcessor<FlushProcessorContext> {
   }
 
   @Override
-  public void processMeter(MetricName name, Metered meter, FlushProcessorContext context) {
+  public void processMeter(MetricName name, Metered meter, FlushProcessorContext context) throws Exception {
     throw new UnsupportedOperationException();
   }
 
   @Override
-  public void processCounter(MetricName name, Counter counter, FlushProcessorContext context) {
+  public void processCounter(MetricName name, Counter counter, FlushProcessorContext context) throws Exception {
     long count;
     // handle delta counter
     if (counter instanceof DeltaCounter) {
@@ -75,7 +75,7 @@ public class FlushProcessor implements MetricProcessor<FlushProcessorContext> {
   }
 
   @Override
-  public void processHistogram(MetricName name, Histogram histogram, FlushProcessorContext context) {
+  public void processHistogram(MetricName name, Histogram histogram, FlushProcessorContext context) throws Exception {
     if (histogram instanceof WavefrontHistogram) {
       WavefrontHistogram wavefrontHistogram = (WavefrontHistogram) histogram;
       if (useWavefrontHistograms) {
@@ -210,12 +210,12 @@ public class FlushProcessor implements MetricProcessor<FlushProcessorContext> {
   }
 
   @Override
-  public void processTimer(MetricName name, Timer timer, FlushProcessorContext context) {
+  public void processTimer(MetricName name, Timer timer, FlushProcessorContext context) throws Exception {
     throw new UnsupportedOperationException();
   }
 
   @Override
-  public void processGauge(MetricName name, Gauge<?> gauge, FlushProcessorContext context) {
+  public void processGauge(MetricName name, Gauge<?> gauge, FlushProcessorContext context) throws Exception {
     @SuppressWarnings("unchecked")
     ChangeableGauge<Double> changeableGauge = (ChangeableGauge<Double>) gauge;
     Double value = changeableGauge.value();

@@ -2,22 +2,22 @@ package com.wavefront.agent;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.util.concurrent.RecyclableRateLimiter;
+
 import com.tdunning.math.stats.AgentDigest;
 import com.tdunning.math.stats.AgentDigest.AgentDigestMarshaller;
 import com.uber.tchannel.api.TChannel;
 import com.uber.tchannel.channels.Connection;
-import com.wavefront.agent.auth.TokenAuthenticator;
-import com.wavefront.agent.auth.TokenAuthenticatorBuilder;
 import com.wavefront.agent.channel.CachingHostnameLookupResolver;
+import com.wavefront.agent.channel.ConnectionTrackingHandler;
 import com.wavefront.agent.channel.HealthCheckManager;
 import com.wavefront.agent.channel.HealthCheckManagerImpl;
+import com.wavefront.agent.channel.IdleStateEventHandler;
+import com.wavefront.agent.channel.PlainTextOrHttpFrameDecoder;
 import com.wavefront.agent.channel.SharedGraphiteHostAnnotator;
 import com.wavefront.agent.config.ConfigurationException;
-import com.wavefront.agent.data.EntityProperties;
-import com.wavefront.agent.data.QueueingReason;
 import com.wavefront.agent.formatter.GraphiteFormatter;
 import com.wavefront.agent.handlers.DelegatingReportableEntityHandlerFactoryImpl;
 import com.wavefront.agent.handlers.DeltaCounterAccumulationHandlerImpl;
@@ -57,10 +57,6 @@ import com.wavefront.agent.preprocessor.PreprocessorRuleMetrics;
 import com.wavefront.agent.preprocessor.ReportPointAddPrefixTransformer;
 import com.wavefront.agent.preprocessor.ReportPointTimestampInRangeFilter;
 import com.wavefront.agent.preprocessor.SpanSanitizeTransformer;
-import com.wavefront.agent.queueing.QueueingFactory;
-import com.wavefront.agent.queueing.QueueingFactoryImpl;
-import com.wavefront.agent.queueing.TaskQueueFactory;
-import com.wavefront.agent.queueing.TaskQueueFactoryImpl;
 import com.wavefront.agent.sampler.SpanSamplerUtils;
 import com.wavefront.api.agent.AgentConfiguration;
 import com.wavefront.common.NamedThreadFactory;
@@ -83,30 +79,27 @@ import com.wavefront.sdk.entities.tracing.sampling.CompositeSampler;
 import com.wavefront.sdk.entities.tracing.sampling.Sampler;
 import com.yammer.metrics.Metrics;
 import com.yammer.metrics.core.Counter;
-import io.netty.channel.ChannelHandler;
-import io.netty.channel.ChannelOption;
-import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
-import io.netty.handler.codec.bytes.ByteArrayDecoder;
+
 import net.openhft.chronicle.map.ChronicleMap;
+
 import org.apache.commons.lang.BooleanUtils;
-import org.apache.commons.lang3.ObjectUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.http.client.HttpClient;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.impl.client.DefaultHttpRequestRetryHandler;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.logstash.beats.Server;
-import wavefront.report.ReportPoint;
 
-import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
 import java.io.File;
+import java.io.IOException;
 import java.net.BindException;
 import java.net.InetAddress;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
@@ -118,13 +111,21 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
+import javax.annotation.Nullable;
+
+import io.netty.channel.ChannelHandler;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
+import io.netty.handler.codec.bytes.ByteArrayDecoder;
+import io.netty.handler.timeout.IdleStateHandler;
+
+import wavefront.report.ReportPoint;
+
 import static com.google.common.base.Preconditions.checkArgument;
-import static com.wavefront.agent.ProxyUtil.createInitializer;
-import static com.wavefront.agent.data.EntityProperties.NO_RATE_LIMIT;
-import static com.wavefront.agent.handlers.ReportableEntityHandlerFactoryImpl.VALID_HISTOGRAMS_LOGGER;
-import static com.wavefront.agent.handlers.ReportableEntityHandlerFactoryImpl.VALID_POINTS_LOGGER;
-import static com.wavefront.common.Utils.csvToList;
-import static com.wavefront.common.Utils.lazySupplier;
+import static com.wavefront.agent.Utils.lazySupplier;
 
 /**
  * Push-only Agent.
@@ -133,29 +134,22 @@ import static com.wavefront.common.Utils.lazySupplier;
  */
 public class PushAgent extends AbstractAgent {
 
-  protected final Map<Integer, Thread> listeners = new HashMap<>();
+  protected final List<Thread> managedThreads = new ArrayList<>();
   protected final IdentityHashMap<ChannelOption<?>, Object> childChannelOptions =
       new IdentityHashMap<>();
   protected ScheduledExecutorService histogramExecutor;
   protected ScheduledExecutorService histogramFlushExecutor;
-  @VisibleForTesting
-  protected List<Runnable> histogramFlushRunnables = new ArrayList<>();
   protected final Counter bindErrors = Metrics.newCounter(
       ExpectedAgentMetric.LISTENERS_BIND_ERRORS.metricName);
-  protected TaskQueueFactory taskQueueFactory;
   protected SharedGraphiteHostAnnotator remoteHostAnnotator;
   protected Function<InetAddress, String> hostnameResolver;
   protected SenderTaskFactory senderTaskFactory;
-  protected QueueingFactory queueingFactory;
   protected ReportableEntityHandlerFactory handlerFactory;
-  protected ReportableEntityHandlerFactory deltaCounterHandlerFactory;
   protected HealthCheckManager healthCheckManager;
-  protected TokenAuthenticator tokenAuthenticator = TokenAuthenticator.DUMMY_AUTHENTICATOR;
-  protected final Supplier<Map<ReportableEntityType, ReportableEntityDecoder<?, ?>>>
-      decoderSupplier = lazySupplier(() ->
-      ImmutableMap.<ReportableEntityType, ReportableEntityDecoder<?, ?>>builder().
+  protected Supplier<Map<ReportableEntityType, ReportableEntityDecoder>> decoderSupplier =
+      lazySupplier(() -> ImmutableMap.<ReportableEntityType, ReportableEntityDecoder>builder().
           put(ReportableEntityType.POINT, new ReportPointDecoderWrapper(
-              new GraphiteDecoder("unknown", proxyConfig.getCustomSourceTags()))).
+              new GraphiteDecoder("unknown", customSourceTags))).
           put(ReportableEntityType.SOURCE_TAG, new ReportSourceTagDecoder()).
           put(ReportableEntityType.HISTOGRAM, new ReportPointDecoderWrapper(
               new HistogramDecoder("unknown"))).
@@ -166,73 +160,76 @@ public class PushAgent extends AbstractAgent {
   private Logger blockedHistogramsLogger;
   private Logger blockedSpansLogger;
 
-  public static void main(String[] args) {
+  public static void main(String[] args) throws IOException {
     // Start the ssh daemon
     new PushAgent().start(args);
   }
 
-  protected void setupMemoryGuard() {
-    if (proxyConfig.getMemGuardFlushThreshold() > 0) {
-      float threshold = ((float) proxyConfig.getMemGuardFlushThreshold() / 100);
-      new ProxyMemoryGuard(() ->
-          senderTaskFactory.drainBuffersToQueue(QueueingReason.MEMORY_PRESSURE), threshold);
-    }
+  public PushAgent() {
+    super(false, true);
+  }
+
+  @Deprecated
+  protected PushAgent(boolean reportAsPushAgent) {
+    super(false, reportAsPushAgent);
+  }
+
+  @Override
+  protected void setupMemoryGuard(double threshold) {
+    new ProxyMemoryGuard(senderTaskFactory::drainBuffersToQueue, threshold);
   }
 
   @Override
   protected void startListeners() {
-    blockedPointsLogger = Logger.getLogger(proxyConfig.getBlockedPointsLoggerName());
-    blockedHistogramsLogger = Logger.getLogger(proxyConfig.getBlockedHistogramsLoggerName());
-    blockedSpansLogger = Logger.getLogger(proxyConfig.getBlockedSpansLoggerName());
+    blockedPointsLogger = Logger.getLogger(blockedPointsLoggerName);
+    blockedHistogramsLogger = Logger.getLogger(blockedHistogramsLoggerName);
+    blockedSpansLogger = Logger.getLogger(blockedSpansLoggerName);
 
-    if (proxyConfig.getSoLingerTime() >= 0) {
-      childChannelOptions.put(ChannelOption.SO_LINGER, proxyConfig.getSoLingerTime());
+    if (soLingerTime >= 0) {
+      childChannelOptions.put(ChannelOption.SO_LINGER, soLingerTime);
     }
-    hostnameResolver = new CachingHostnameLookupResolver(proxyConfig.isDisableRdnsLookup(),
+    hostnameResolver = new CachingHostnameLookupResolver(disableRdnsLookup,
         ExpectedAgentMetric.RDNS_CACHE_SIZE.metricName);
-    taskQueueFactory = new TaskQueueFactoryImpl(proxyConfig.getBufferFile(),
-        proxyConfig.isPurgeBuffer());
-    remoteHostAnnotator = new SharedGraphiteHostAnnotator(proxyConfig.getCustomSourceTags(),
-        hostnameResolver);
-    queueingFactory = new QueueingFactoryImpl(apiContainer, agentId, taskQueueFactory, entityProps);
-    senderTaskFactory = new SenderTaskFactoryImpl(apiContainer, agentId, taskQueueFactory,
-        queueingFactory, entityProps);
-    handlerFactory = new ReportableEntityHandlerFactoryImpl(senderTaskFactory,
-        proxyConfig.getPushBlockedSamples(), validationConfiguration, blockedPointsLogger,
-        blockedHistogramsLogger, blockedSpansLogger);
-    healthCheckManager = new HealthCheckManagerImpl(proxyConfig);
-    tokenAuthenticator = configureTokenAuthenticator();
+    remoteHostAnnotator = new SharedGraphiteHostAnnotator(customSourceTags, hostnameResolver);
+    senderTaskFactory = new SenderTaskFactoryImpl(agentAPI, agentId, pushRateLimiter,
+        pushFlushInterval, pushFlushMaxPoints, pushMemoryBufferLimit);
+    handlerFactory = new ReportableEntityHandlerFactoryImpl(senderTaskFactory, pushBlockedSamples,
+        flushThreads, () -> validationConfiguration, blockedPointsLogger, blockedHistogramsLogger,
+        blockedSpansLogger);
+    healthCheckManager = new HealthCheckManagerImpl(httpHealthCheckPath,
+        httpHealthCheckResponseContentType, httpHealthCheckPassStatusCode,
+        httpHealthCheckPassResponseBody, httpHealthCheckFailStatusCode,
+        httpHealthCheckFailResponseBody);
 
     shutdownTasks.add(() -> senderTaskFactory.shutdown());
-    shutdownTasks.add(() -> senderTaskFactory.drainBuffersToQueue(null));
+    shutdownTasks.add(() -> senderTaskFactory.drainBuffersToQueue());
 
-    if (proxyConfig.getAdminApiListenerPort() > 0) {
-      startAdminListener(proxyConfig.getAdminApiListenerPort());
+    if (adminApiListenerPort > 0) {
+      startAdminListener(adminApiListenerPort);
     }
-    csvToList(proxyConfig.getHttpHealthCheckPorts()).forEach(strPort ->
+    portIterator(httpHealthCheckPorts).forEachRemaining(strPort ->
         startHealthCheckListener(Integer.parseInt(strPort)));
 
-    csvToList(proxyConfig.getPushListenerPorts()).forEach(strPort -> {
+    portIterator(pushListenerPorts).forEachRemaining(strPort -> {
       startGraphiteListener(strPort, handlerFactory, remoteHostAnnotator);
       logger.info("listening on port: " + strPort + " for Wavefront metrics");
     });
 
-    csvToList(proxyConfig.getDeltaCountersAggregationListenerPorts()).forEach(
-        strPort -> {
-          startDeltaCounterListener(strPort, remoteHostAnnotator, senderTaskFactory);
-          logger.info("listening on port: " + strPort + " for Wavefront delta counter metrics");
-        });
+    portIterator(deltaCountersAggregationListenerPorts).forEachRemaining(strPort -> {
+      startDeltaCounterListener(strPort, remoteHostAnnotator, senderTaskFactory);
+      logger.info("listening on port: " + strPort + " for Wavefront delta counter metrics");
+    });
 
     {
       // Histogram bootstrap.
-      List<String> histMinPorts = csvToList(proxyConfig.getHistogramMinuteListenerPorts());
-      List<String> histHourPorts = csvToList(proxyConfig.getHistogramHourListenerPorts());
-      List<String> histDayPorts = csvToList(proxyConfig.getHistogramDayListenerPorts());
-      List<String> histDistPorts = csvToList(proxyConfig.getHistogramDistListenerPorts());
+      Iterator<String> histMinPorts = portIterator(histogramMinuteListenerPorts);
+      Iterator<String> histHourPorts = portIterator(histogramHourListenerPorts);
+      Iterator<String> histDayPorts = portIterator(histogramDayListenerPorts);
+      Iterator<String> histDistPorts = portIterator(histogramDistListenerPorts);
 
-      int activeHistogramAggregationTypes = (histDayPorts.size() > 0 ? 1 : 0) +
-          (histHourPorts.size() > 0 ? 1 : 0) + (histMinPorts.size() > 0 ? 1 : 0) +
-          (histDistPorts.size() > 0 ? 1 : 0);
+      int activeHistogramAggregationTypes = (histDayPorts.hasNext() ? 1 : 0) +
+          (histHourPorts.hasNext() ? 1 : 0) + (histMinPorts.hasNext() ? 1 : 0) +
+          (histDistPorts.hasNext() ? 1 : 0);
       if (activeHistogramAggregationTypes > 0) { /*Histograms enabled*/
         histogramExecutor = Executors.newScheduledThreadPool(
             1 + activeHistogramAggregationTypes, new NamedThreadFactory("histogram-service"));
@@ -242,97 +239,96 @@ public class PushAgent extends AbstractAgent {
         managedExecutors.add(histogramExecutor);
         managedExecutors.add(histogramFlushExecutor);
 
-        File baseDirectory = new File(proxyConfig.getHistogramStateDirectory());
+        File baseDirectory = new File(histogramStateDirectory);
 
         // Central dispatch
-        ReportableEntityHandler<ReportPoint, String> pointHandler = handlerFactory.getHandler(
+        @SuppressWarnings("unchecked")
+        ReportableEntityHandler<ReportPoint> pointHandler = handlerFactory.getHandler(
             HandlerKey.of(ReportableEntityType.HISTOGRAM, "histogram_ports"));
 
-        startHistogramListeners(histMinPorts, pointHandler, remoteHostAnnotator,
-            Utils.Granularity.MINUTE, proxyConfig.getHistogramMinuteFlushSecs(),
-            proxyConfig.isHistogramMinuteMemoryCache(), baseDirectory,
-            proxyConfig.getHistogramMinuteAccumulatorSize(),
-            proxyConfig.getHistogramMinuteAvgKeyBytes(),
-            proxyConfig.getHistogramMinuteAvgDigestBytes(),
-            proxyConfig.getHistogramMinuteCompression(),
-            proxyConfig.isHistogramMinuteAccumulatorPersisted());
-        startHistogramListeners(histHourPorts, pointHandler, remoteHostAnnotator,
-            Utils.Granularity.HOUR, proxyConfig.getHistogramHourFlushSecs(),
-            proxyConfig.isHistogramHourMemoryCache(), baseDirectory,
-            proxyConfig.getHistogramHourAccumulatorSize(),
-            proxyConfig.getHistogramHourAvgKeyBytes(),
-            proxyConfig.getHistogramHourAvgDigestBytes(),
-            proxyConfig.getHistogramHourCompression(),
-            proxyConfig.isHistogramHourAccumulatorPersisted());
-        startHistogramListeners(histDayPorts, pointHandler, remoteHostAnnotator,
-            Utils.Granularity.DAY, proxyConfig.getHistogramDayFlushSecs(),
-            proxyConfig.isHistogramDayMemoryCache(), baseDirectory,
-            proxyConfig.getHistogramDayAccumulatorSize(),
-            proxyConfig.getHistogramDayAvgKeyBytes(),
-            proxyConfig.getHistogramDayAvgDigestBytes(),
-            proxyConfig.getHistogramDayCompression(),
-            proxyConfig.isHistogramDayAccumulatorPersisted());
-        startHistogramListeners(histDistPorts, pointHandler, remoteHostAnnotator,
-            null, proxyConfig.getHistogramDistFlushSecs(), proxyConfig.isHistogramDistMemoryCache(),
-            baseDirectory, proxyConfig.getHistogramDistAccumulatorSize(),
-            proxyConfig.getHistogramDistAvgKeyBytes(), proxyConfig.getHistogramDistAvgDigestBytes(),
-            proxyConfig.getHistogramDistCompression(),
-            proxyConfig.isHistogramDistAccumulatorPersisted());
+        if (histMinPorts.hasNext()) {
+          startHistogramListeners(histMinPorts, pointHandler, remoteHostAnnotator,
+              Utils.Granularity.MINUTE, histogramMinuteFlushSecs, histogramMinuteMemoryCache,
+              baseDirectory, histogramMinuteAccumulatorSize, histogramMinuteAvgKeyBytes,
+              histogramMinuteAvgDigestBytes, histogramMinuteCompression,
+              histogramMinuteAccumulatorPersisted);
+        }
+
+        if (histHourPorts.hasNext()) {
+          startHistogramListeners(histHourPorts, pointHandler, remoteHostAnnotator,
+              Utils.Granularity.HOUR, histogramHourFlushSecs, histogramHourMemoryCache,
+              baseDirectory, histogramHourAccumulatorSize, histogramHourAvgKeyBytes,
+              histogramHourAvgDigestBytes, histogramHourCompression,
+              histogramHourAccumulatorPersisted);
+        }
+
+        if (histDayPorts.hasNext()) {
+          startHistogramListeners(histDayPorts, pointHandler, remoteHostAnnotator,
+              Utils.Granularity.DAY, histogramDayFlushSecs, histogramDayMemoryCache,
+              baseDirectory, histogramDayAccumulatorSize, histogramDayAvgKeyBytes,
+              histogramDayAvgDigestBytes, histogramDayCompression,
+              histogramDayAccumulatorPersisted);
+        }
+
+        if (histDistPorts.hasNext()) {
+          startHistogramListeners(histDistPorts, pointHandler, remoteHostAnnotator,
+              null, histogramDistFlushSecs, histogramDistMemoryCache,
+              baseDirectory, histogramDistAccumulatorSize, histogramDistAvgKeyBytes,
+              histogramDistAvgDigestBytes, histogramDistCompression,
+              histogramDistAccumulatorPersisted);
+        }
       }
     }
 
-    if (StringUtils.isNotBlank(proxyConfig.getGraphitePorts()) ||
-        StringUtils.isNotBlank(proxyConfig.getPicklePorts())) {
+    if (StringUtils.isNotBlank(graphitePorts) || StringUtils.isNotBlank(picklePorts)) {
       if (tokenAuthenticator.authRequired()) {
         logger.warning("Graphite mode is not compatible with HTTP authentication, ignoring");
       } else {
-        Preconditions.checkNotNull(proxyConfig.getGraphiteFormat(),
+        Preconditions.checkNotNull(graphiteFormat,
             "graphiteFormat must be supplied to enable graphite support");
-        Preconditions.checkNotNull(proxyConfig.getGraphiteDelimiters(),
+        Preconditions.checkNotNull(graphiteDelimiters,
             "graphiteDelimiters must be supplied to enable graphite support");
-        GraphiteFormatter graphiteFormatter = new GraphiteFormatter(proxyConfig.getGraphiteFormat(),
-            proxyConfig.getGraphiteDelimiters(), proxyConfig.getGraphiteFieldsToRemove());
-        csvToList(proxyConfig.getGraphitePorts()).forEach(strPort -> {
+        GraphiteFormatter graphiteFormatter = new GraphiteFormatter(graphiteFormat,
+            graphiteDelimiters, graphiteFieldsToRemove);
+        portIterator(graphitePorts).forEachRemaining(strPort -> {
           preprocessors.getSystemPreprocessor(strPort).forPointLine().
               addTransformer(0, graphiteFormatter);
           startGraphiteListener(strPort, handlerFactory, null);
           logger.info("listening on port: " + strPort + " for graphite metrics");
         });
-        csvToList(proxyConfig.getPicklePorts()).forEach(strPort ->
+        portIterator(picklePorts).forEachRemaining(strPort ->
             startPickleListener(strPort, handlerFactory, graphiteFormatter));
       }
     }
-    csvToList(proxyConfig.getOpentsdbPorts()).forEach(strPort ->
+    portIterator(opentsdbPorts).forEachRemaining(strPort ->
         startOpenTsdbListener(strPort, handlerFactory));
-    if (proxyConfig.getDataDogJsonPorts() != null) {
+    if (dataDogJsonPorts != null) {
       HttpClient httpClient = HttpClientBuilder.create().
           useSystemProperties().
-          setUserAgent(proxyConfig.getHttpUserAgent()).
+          setUserAgent(httpUserAgent).
           setConnectionTimeToLive(1, TimeUnit.MINUTES).
-          setRetryHandler(new DefaultHttpRequestRetryHandler(proxyConfig.getHttpAutoRetries(),
-              true)).
+          setRetryHandler(new DefaultHttpRequestRetryHandler(httpAutoRetries, true)).
           setDefaultRequestConfig(
               RequestConfig.custom().
                   setContentCompressionEnabled(true).
                   setRedirectsEnabled(true).
-                  setConnectTimeout(proxyConfig.getHttpConnectTimeout()).
-                  setConnectionRequestTimeout(proxyConfig.getHttpConnectTimeout()).
-                  setSocketTimeout(proxyConfig.getHttpRequestTimeout()).build()).
+                  setConnectTimeout(httpConnectTimeout).
+                  setConnectionRequestTimeout(httpConnectTimeout).
+                  setSocketTimeout(httpRequestTimeout).build()).
           build();
 
-      csvToList(proxyConfig.getDataDogJsonPorts()).forEach(strPort ->
+      portIterator(dataDogJsonPorts).forEachRemaining(strPort ->
           startDataDogListener(strPort, handlerFactory, httpClient));
     }
     // sampler for spans
-    Sampler rateSampler = SpanSamplerUtils.getRateSampler(proxyConfig.getTraceSamplingRate());
-    Sampler durationSampler = SpanSamplerUtils.getDurationSampler(
-        proxyConfig.getTraceSamplingDuration());
+    Sampler rateSampler = SpanSamplerUtils.getRateSampler(traceSamplingRate);
+    Sampler durationSampler = SpanSamplerUtils.getDurationSampler(traceSamplingDuration);
     List<Sampler> samplers = SpanSamplerUtils.fromSamplers(rateSampler, durationSampler);
     Sampler compositeSampler = new CompositeSampler(samplers);
 
-    csvToList(proxyConfig.getTraceListenerPorts()).forEach(strPort ->
+    portIterator(traceListenerPorts).forEachRemaining(strPort ->
         startTraceListener(strPort, handlerFactory, compositeSampler));
-    csvToList(proxyConfig.getTraceJaegerListenerPorts()).forEach(strPort -> {
+    portIterator(traceJaegerListenerPorts).forEachRemaining(strPort -> {
       PreprocessorRuleMetrics ruleMetrics = new PreprocessorRuleMetrics(
           Metrics.newCounter(new TaggedMetricName("point.spanSanitize", "count", "port", strPort)),
           null, null
@@ -342,7 +338,7 @@ public class PushAgent extends AbstractAgent {
       startTraceJaegerListener(strPort, handlerFactory,
           new InternalProxyWavefrontClient(handlerFactory, strPort), compositeSampler);
     });
-    csvToList(proxyConfig.getTraceJaegerHttpListenerPorts()).forEach(strPort -> {
+    portIterator(traceJaegerHttpListenerPorts).forEachRemaining(strPort -> {
       PreprocessorRuleMetrics ruleMetrics = new PreprocessorRuleMetrics(
           Metrics.newCounter(new TaggedMetricName("point.spanSanitize", "count", "port", strPort)),
           null, null
@@ -352,7 +348,9 @@ public class PushAgent extends AbstractAgent {
       startTraceJaegerHttpListener(strPort, handlerFactory,
           new InternalProxyWavefrontClient(handlerFactory, strPort), compositeSampler);
     });
-    csvToList(proxyConfig.getTraceZipkinListenerPorts()).forEach(strPort -> {
+    portIterator(pushRelayListenerPorts).forEachRemaining(strPort ->
+        startRelayListener(strPort, handlerFactory, remoteHostAnnotator));
+    portIterator(traceZipkinListenerPorts).forEachRemaining(strPort -> {
       PreprocessorRuleMetrics ruleMetrics = new PreprocessorRuleMetrics(
           Metrics.newCounter(new TaggedMetricName("point.spanSanitize", "count", "port", strPort)),
           null, null
@@ -362,27 +360,25 @@ public class PushAgent extends AbstractAgent {
       startTraceZipkinListener(strPort, handlerFactory,
           new InternalProxyWavefrontClient(handlerFactory, strPort), compositeSampler);
     });
-    csvToList(proxyConfig.getPushRelayListenerPorts()).forEach(strPort ->
-        startRelayListener(strPort, handlerFactory, remoteHostAnnotator));
-    csvToList(proxyConfig.getJsonListenerPorts()).forEach(strPort ->
+    portIterator(jsonListenerPorts).forEachRemaining(strPort ->
         startJsonListener(strPort, handlerFactory));
-    csvToList(proxyConfig.getWriteHttpJsonListenerPorts()).forEach(strPort ->
+    portIterator(writeHttpJsonListenerPorts).forEachRemaining(strPort ->
         startWriteHttpJsonListener(strPort, handlerFactory));
 
     // Logs ingestion.
-    if (proxyConfig.getFilebeatPort() > 0 || proxyConfig.getRawLogsPort() > 0) {
+    if (filebeatPort > 0 || rawLogsPort > 0) {
       if (loadLogsIngestionConfig() != null) {
         logger.info("Initializing logs ingestion");
         try {
           final LogsIngester logsIngester = new LogsIngester(handlerFactory,
-              this::loadLogsIngestionConfig, proxyConfig.getPrefix());
+              this::loadLogsIngestionConfig, prefix);
           logsIngester.start();
 
-          if (proxyConfig.getFilebeatPort() > 0) {
-            startLogsIngestionListener(proxyConfig.getFilebeatPort(), logsIngester);
+          if (filebeatPort > 0) {
+            startLogsIngestionListener(filebeatPort, logsIngester);
           }
-          if (proxyConfig.getRawLogsPort() > 0) {
-            startRawLogsIngestionListener(proxyConfig.getRawLogsPort(), logsIngester);
+          if (rawLogsPort > 0) {
+            startRawLogsIngestionListener(rawLogsPort, logsIngester);
           }
         } catch (ConfigurationException e) {
           logger.log(Level.SEVERE, "Cannot start logsIngestion", e);
@@ -391,22 +387,20 @@ public class PushAgent extends AbstractAgent {
         logger.warning("Cannot start logsIngestion: invalid configuration or no config specified");
       }
     }
-    setupMemoryGuard();
   }
 
   protected void startJsonListener(String strPort, ReportableEntityHandlerFactory handlerFactory) {
     final int port = Integer.parseInt(strPort);
     registerTimestampFilter(strPort);
-    if (proxyConfig.isHttpHealthCheckAllPorts()) healthCheckManager.enableHealthcheck(port);
+    if (httpHealthCheckAllPorts) healthCheckManager.enableHealthcheck(port);
 
     ChannelHandler channelHandler = new JsonMetricsPortUnificationHandler(strPort,
-        tokenAuthenticator, healthCheckManager, handlerFactory, proxyConfig.getPrefix(),
-        proxyConfig.getHostname(), preprocessors.get(strPort));
+        tokenAuthenticator, healthCheckManager, handlerFactory, prefix, hostname,
+        preprocessors.get(strPort));
 
-    startAsManagedThread(port, new TcpIngester(createInitializer(channelHandler, port,
-        proxyConfig.getPushListenerMaxReceivedLength(), proxyConfig.getPushListenerHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()), port).
-        withChildChannelOptions(childChannelOptions), "listener-plaintext-json-" + port);
+    startAsManagedThread(new TcpIngester(createInitializer(channelHandler, strPort,
+        pushListenerMaxReceivedLength, pushListenerHttpBufferSize, listenerIdleConnectionTimeout),
+            port).withChildChannelOptions(childChannelOptions), "listener-plaintext-json-" + port);
     logger.info("listening on port: " + strPort + " for JSON metrics data");
   }
 
@@ -415,16 +409,16 @@ public class PushAgent extends AbstractAgent {
     final int port = Integer.parseInt(strPort);
     registerPrefixFilter(strPort);
     registerTimestampFilter(strPort);
-    if (proxyConfig.isHttpHealthCheckAllPorts()) healthCheckManager.enableHealthcheck(port);
+    if (httpHealthCheckAllPorts) healthCheckManager.enableHealthcheck(port);
 
     ChannelHandler channelHandler = new WriteHttpJsonPortUnificationHandler(strPort,
-        tokenAuthenticator, healthCheckManager, handlerFactory, proxyConfig.getHostname(),
+        tokenAuthenticator, healthCheckManager, handlerFactory, hostname,
         preprocessors.get(strPort));
 
-    startAsManagedThread(port, new TcpIngester(createInitializer(channelHandler, port,
-        proxyConfig.getPushListenerMaxReceivedLength(), proxyConfig.getPushListenerHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()), port).
-        withChildChannelOptions(childChannelOptions), "listener-plaintext-writehttpjson-" + port);
+    startAsManagedThread(new TcpIngester(createInitializer(channelHandler, strPort,
+        pushListenerMaxReceivedLength, pushListenerHttpBufferSize, listenerIdleConnectionTimeout),
+            port).withChildChannelOptions(childChannelOptions),
+        "listener-plaintext-writehttpjson-" + port);
     logger.info("listening on port: " + strPort + " for write_http data");
   }
 
@@ -433,19 +427,19 @@ public class PushAgent extends AbstractAgent {
     int port = Integer.parseInt(strPort);
     registerPrefixFilter(strPort);
     registerTimestampFilter(strPort);
-    if (proxyConfig.isHttpHealthCheckAllPorts()) healthCheckManager.enableHealthcheck(port);
+    if (httpHealthCheckAllPorts) healthCheckManager.enableHealthcheck(port);
 
     ReportableEntityDecoder<String, ReportPoint> openTSDBDecoder = new ReportPointDecoderWrapper(
-        new OpenTSDBDecoder("unknown", proxyConfig.getCustomSourceTags()));
+        new OpenTSDBDecoder("unknown", customSourceTags));
 
     ChannelHandler channelHandler = new OpenTSDBPortUnificationHandler(strPort, tokenAuthenticator,
         healthCheckManager, openTSDBDecoder, handlerFactory, preprocessors.get(strPort),
         hostnameResolver);
 
-    startAsManagedThread(port, new TcpIngester(createInitializer(channelHandler, port,
-        proxyConfig.getPushListenerMaxReceivedLength(), proxyConfig.getPushListenerHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()), port).
-        withChildChannelOptions(childChannelOptions), "listener-plaintext-opentsdb-" + port);
+    startAsManagedThread(new TcpIngester(createInitializer(channelHandler, strPort,
+        pushListenerMaxReceivedLength, pushListenerHttpBufferSize, listenerIdleConnectionTimeout),
+            port).withChildChannelOptions(childChannelOptions),
+        "listener-plaintext-opentsdb-" + port);
     logger.info("listening on port: " + strPort + " for OpenTSDB metrics");
   }
 
@@ -460,17 +454,16 @@ public class PushAgent extends AbstractAgent {
     int port = Integer.parseInt(strPort);
     registerPrefixFilter(strPort);
     registerTimestampFilter(strPort);
-    if (proxyConfig.isHttpHealthCheckAllPorts()) healthCheckManager.enableHealthcheck(port);
+    if (httpHealthCheckAllPorts) healthCheckManager.enableHealthcheck(port);
 
     ChannelHandler channelHandler = new DataDogPortUnificationHandler(strPort, healthCheckManager,
-        handlerFactory, proxyConfig.isDataDogProcessSystemMetrics(),
-        proxyConfig.isDataDogProcessServiceChecks(), httpClient,
-        proxyConfig.getDataDogRequestRelayTarget(), preprocessors.get(strPort));
+        handlerFactory, dataDogProcessSystemMetrics, dataDogProcessServiceChecks, httpClient,
+        dataDogRequestRelayTarget, preprocessors.get(strPort));
 
-    startAsManagedThread(port, new TcpIngester(createInitializer(channelHandler, port,
-        proxyConfig.getPushListenerMaxReceivedLength(), proxyConfig.getPushListenerHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()), port).
-        withChildChannelOptions(childChannelOptions), "listener-plaintext-datadog-" + port);
+    startAsManagedThread(new TcpIngester(createInitializer(channelHandler, strPort,
+        pushListenerMaxReceivedLength, pushListenerHttpBufferSize, listenerIdleConnectionTimeout),
+            port).withChildChannelOptions(childChannelOptions),
+        "listener-plaintext-datadog-" + port);
     logger.info("listening on port: " + strPort + " for DataDog metrics");
   }
 
@@ -487,17 +480,17 @@ public class PushAgent extends AbstractAgent {
     registerTimestampFilter(strPort);
 
     // Set up a custom handler
+    //noinspection unchecked
     ChannelHandler channelHandler = new ChannelByteArrayHandler(
-        new PickleProtocolDecoder("unknown", proxyConfig.getCustomSourceTags(),
-            formatter.getMetricMangler(), port),
+        new PickleProtocolDecoder("unknown", customSourceTags, formatter.getMetricMangler(), port),
         handlerFactory.getHandler(HandlerKey.of(ReportableEntityType.POINT, strPort)),
-        preprocessors.get(strPort), blockedPointsLogger);
+        preprocessors.get(strPort));
 
-    startAsManagedThread(port, new TcpIngester(createInitializer(ImmutableList.of(
+    startAsManagedThread(new TcpIngester(createInitializer(ImmutableList.of(
         () -> new LengthFieldBasedFrameDecoder(ByteOrder.BIG_ENDIAN, 1000000, 0, 4, 0, 4, false),
-        ByteArrayDecoder::new, () -> channelHandler), port,
-        proxyConfig.getListenerIdleConnectionTimeout()), port).
-            withChildChannelOptions(childChannelOptions), "listener-binary-pickle-" + strPort);
+        () -> new ByteArrayDecoder(), () -> channelHandler), strPort,
+        listenerIdleConnectionTimeout), port).withChildChannelOptions(childChannelOptions),
+        "listener-binary-pickle-" + strPort);
     logger.info("listening on port: " + strPort + " for Graphite/pickle protocol metrics");
   }
 
@@ -507,20 +500,16 @@ public class PushAgent extends AbstractAgent {
     final int port = Integer.parseInt(strPort);
     registerPrefixFilter(strPort);
     registerTimestampFilter(strPort);
-    if (proxyConfig.isHttpHealthCheckAllPorts()) healthCheckManager.enableHealthcheck(port);
+    if (httpHealthCheckAllPorts) healthCheckManager.enableHealthcheck(port);
 
     ChannelHandler channelHandler = new TracePortUnificationHandler(strPort, tokenAuthenticator,
         healthCheckManager, new SpanDecoder("unknown"), new SpanLogsDecoder(),
-        preprocessors.get(strPort), handlerFactory, sampler,
-        proxyConfig.isTraceAlwaysSampleErrors(),
-        () -> entityProps.get(ReportableEntityType.TRACE).isFeatureDisabled(),
-        () -> entityProps.get(ReportableEntityType.TRACE_SPAN_LOGS).isFeatureDisabled());
+        preprocessors.get(strPort), handlerFactory, sampler, traceAlwaysSampleErrors,
+        traceDisabled::get, spanLogsDisabled::get);
 
-    startAsManagedThread(port, new TcpIngester(createInitializer(channelHandler, port,
-        proxyConfig.getTraceListenerMaxReceivedLength(),
-        proxyConfig.getTraceListenerHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()), port).
-        withChildChannelOptions(childChannelOptions), "listener-plaintext-trace-" + port);
+    startAsManagedThread(new TcpIngester(createInitializer(channelHandler, strPort,
+        traceListenerMaxReceivedLength, traceListenerHttpBufferSize, listenerIdleConnectionTimeout),
+            port).withChildChannelOptions(childChannelOptions), "listener-plaintext-trace-" + port);
     logger.info("listening on port: " + strPort + " for trace data");
   }
 
@@ -532,21 +521,18 @@ public class PushAgent extends AbstractAgent {
       logger.warning("Port: " + strPort + " is not compatible with HTTP authentication, ignoring");
       return;
     }
-    startAsManagedThread(Integer.parseInt(strPort), () -> {
+    startAsManagedThread(() -> {
       activeListeners.inc();
       try {
         TChannel server = new TChannel.Builder("jaeger-collector").
-            setServerPort(Integer.parseInt(strPort)).
+            setServerPort(Integer.valueOf(strPort)).
             build();
         server.
             makeSubChannel("jaeger-collector", Connection.Direction.IN).
             register("Collector::submitBatches", new JaegerTChannelCollectorHandler(strPort,
-                handlerFactory, wfSender,
-                () -> entityProps.get(ReportableEntityType.TRACE).isFeatureDisabled(),
-                () -> entityProps.get(ReportableEntityType.TRACE_SPAN_LOGS).isFeatureDisabled(),
-                preprocessors.get(strPort), sampler, proxyConfig.isTraceAlwaysSampleErrors(),
-                proxyConfig.getTraceJaegerApplicationName(),
-                proxyConfig.getTraceDerivedCustomTagKeys()));
+                handlerFactory, wfSender, traceDisabled::get, spanLogsDisabled::get,
+                preprocessors.get(strPort), sampler, traceAlwaysSampleErrors,
+                traceJaegerApplicationName, traceDerivedCustomTagKeys));
         server.listen().channel().closeFuture().sync();
         server.shutdown(false);
       } catch (InterruptedException e) {
@@ -565,19 +551,15 @@ public class PushAgent extends AbstractAgent {
                                               @Nullable WavefrontSender wfSender,
                                               Sampler sampler) {
     final int port = Integer.parseInt(strPort);
-    if (proxyConfig.isHttpHealthCheckAllPorts()) healthCheckManager.enableHealthcheck(port);
+    if (httpHealthCheckAllPorts) healthCheckManager.enableHealthcheck(port);
 
     ChannelHandler channelHandler = new JaegerPortUnificationHandler(strPort, tokenAuthenticator,
-        healthCheckManager, handlerFactory, wfSender,
-        () -> entityProps.get(ReportableEntityType.TRACE).isFeatureDisabled(),
-        () -> entityProps.get(ReportableEntityType.TRACE_SPAN_LOGS).isFeatureDisabled(),
-        preprocessors.get(strPort), sampler, proxyConfig.isTraceAlwaysSampleErrors(),
-        proxyConfig.getTraceJaegerApplicationName(), proxyConfig.getTraceDerivedCustomTagKeys());
+        healthCheckManager, handlerFactory, wfSender, traceDisabled::get, spanLogsDisabled::get,
+        preprocessors.get(strPort), sampler, traceAlwaysSampleErrors, traceJaegerApplicationName,
+        traceDerivedCustomTagKeys);
 
-    startAsManagedThread(port, new TcpIngester(createInitializer(channelHandler, port,
-        proxyConfig.getTraceListenerMaxReceivedLength(),
-        proxyConfig.getTraceListenerHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()),
+    startAsManagedThread(new TcpIngester(createInitializer(channelHandler, strPort,
+        traceListenerMaxReceivedLength, traceListenerHttpBufferSize, listenerIdleConnectionTimeout),
         port).withChildChannelOptions(childChannelOptions), "listener-jaeger-http-" + port);
     logger.info("listening on port: " + strPort + " for trace data (Jaeger format over HTTP)");
   }
@@ -587,18 +569,14 @@ public class PushAgent extends AbstractAgent {
                                           @Nullable WavefrontSender wfSender,
                                           Sampler sampler) {
     final int port = Integer.parseInt(strPort);
-    if (proxyConfig.isHttpHealthCheckAllPorts()) healthCheckManager.enableHealthcheck(port);
+    if (httpHealthCheckAllPorts) healthCheckManager.enableHealthcheck(port);
     ChannelHandler channelHandler = new ZipkinPortUnificationHandler(strPort, healthCheckManager,
-        handlerFactory, wfSender,
-        () -> entityProps.get(ReportableEntityType.TRACE).isFeatureDisabled(),
-        () -> entityProps.get(ReportableEntityType.TRACE_SPAN_LOGS).isFeatureDisabled(),
-        preprocessors.get(strPort), sampler, proxyConfig.isTraceAlwaysSampleErrors(),
-        proxyConfig.getTraceZipkinApplicationName(), proxyConfig.getTraceDerivedCustomTagKeys());
-    startAsManagedThread(port, new TcpIngester(createInitializer(channelHandler, port,
-        proxyConfig.getTraceListenerMaxReceivedLength(),
-        proxyConfig.getTraceListenerHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()),
-        port).withChildChannelOptions(childChannelOptions), "listener-zipkin-trace-" + port);
+        handlerFactory, wfSender, traceDisabled::get, spanLogsDisabled::get,
+        preprocessors.get(strPort), sampler, traceAlwaysSampleErrors, traceZipkinApplicationName,
+        traceDerivedCustomTagKeys);
+    startAsManagedThread(new TcpIngester(createInitializer(channelHandler, strPort,
+        traceListenerMaxReceivedLength, traceListenerHttpBufferSize, listenerIdleConnectionTimeout),
+            port).withChildChannelOptions(childChannelOptions), "listener-zipkin-trace-" + port);
     logger.info("listening on port: " + strPort + " for trace data (Zipkin format)");
   }
 
@@ -609,63 +587,44 @@ public class PushAgent extends AbstractAgent {
     final int port = Integer.parseInt(strPort);
     registerPrefixFilter(strPort);
     registerTimestampFilter(strPort);
-    if (proxyConfig.isHttpHealthCheckAllPorts()) healthCheckManager.enableHealthcheck(port);
+    if (httpHealthCheckAllPorts) healthCheckManager.enableHealthcheck(port);
 
     WavefrontPortUnificationHandler wavefrontPortUnificationHandler =
         new WavefrontPortUnificationHandler(strPort, tokenAuthenticator, healthCheckManager,
             decoderSupplier.get(), handlerFactory, hostAnnotator, preprocessors.get(strPort));
 
-    startAsManagedThread(port,
-        new TcpIngester(createInitializer(wavefrontPortUnificationHandler, port,
-        proxyConfig.getPushListenerMaxReceivedLength(), proxyConfig.getPushListenerHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()), port).
-        withChildChannelOptions(childChannelOptions), "listener-graphite-" + port);
+    startAsManagedThread(new TcpIngester(createInitializer(wavefrontPortUnificationHandler, strPort,
+        pushListenerMaxReceivedLength, pushListenerHttpBufferSize, listenerIdleConnectionTimeout),
+        port).withChildChannelOptions(childChannelOptions), "listener-graphite-" + port);
   }
 
   @VisibleForTesting
-  protected void startDeltaCounterListener(String strPort,
-                                           SharedGraphiteHostAnnotator hostAnnotator,
+  protected void startDeltaCounterListener(String strPort, SharedGraphiteHostAnnotator hostAnnotator,
                                            SenderTaskFactory senderTaskFactory) {
     final int port = Integer.parseInt(strPort);
     registerPrefixFilter(strPort);
     registerTimestampFilter(strPort);
-    if (proxyConfig.isHttpHealthCheckAllPorts()) healthCheckManager.enableHealthcheck(port);
+    if (httpHealthCheckAllPorts) healthCheckManager.enableHealthcheck(port);
 
-    if (this.deltaCounterHandlerFactory == null) {
-      this.deltaCounterHandlerFactory = new ReportableEntityHandlerFactory() {
-        private final Map<String, ReportableEntityHandler<?, ?>> handlers = new HashMap<>();
-
-        @Override
-        public <T, U> ReportableEntityHandler<T, U> getHandler(HandlerKey handlerKey) {
-          //noinspection unchecked
-          return (ReportableEntityHandler<T, U>) handlers.computeIfAbsent(handlerKey.getHandle(),
-              k -> new DeltaCounterAccumulationHandlerImpl(handlerKey,
-                  proxyConfig.getPushBlockedSamples(),
-                  senderTaskFactory.createSenderTasks(handlerKey),
-                  validationConfiguration, proxyConfig.getDeltaCountersAggregationIntervalSeconds(),
-                  blockedPointsLogger, VALID_POINTS_LOGGER));
-        }
-
-        @Override
-        public void shutdown(@Nonnull String handle) {
-          if (handlers.containsKey(handle)) {
-            handlers.values().forEach(ReportableEntityHandler::shutdown);
-          }
-        }
-      };
-    }
-    shutdownTasks.add(() -> deltaCounterHandlerFactory.shutdown(strPort));
+    ReportableEntityHandlerFactory deltaCounterHandlerFactory = new ReportableEntityHandlerFactory() {
+      private Map<HandlerKey, ReportableEntityHandler> handlers = new HashMap<>();
+      @Override
+      public ReportableEntityHandler getHandler(HandlerKey handlerKey) {
+        return handlers.computeIfAbsent(handlerKey, k -> new DeltaCounterAccumulationHandlerImpl(
+            handlerKey.getHandle(), pushBlockedSamples,
+            senderTaskFactory.createSenderTasks(handlerKey, flushThreads),
+            () -> validationConfiguration, deltaCountersAggregationIntervalSeconds, blockedPointsLogger));
+      }
+    };
 
     WavefrontPortUnificationHandler wavefrontPortUnificationHandler =
         new WavefrontPortUnificationHandler(strPort, tokenAuthenticator, healthCheckManager,
             decoderSupplier.get(), deltaCounterHandlerFactory, hostAnnotator,
             preprocessors.get(strPort));
 
-    startAsManagedThread(port,
-        new TcpIngester(createInitializer(wavefrontPortUnificationHandler, port,
-        proxyConfig.getPushListenerMaxReceivedLength(), proxyConfig.getPushListenerHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()), port).
-        withChildChannelOptions(childChannelOptions), "listener-deltaCounter-" + port);
+    startAsManagedThread(new TcpIngester(createInitializer(wavefrontPortUnificationHandler, strPort,
+        pushListenerMaxReceivedLength, pushListenerHttpBufferSize, listenerIdleConnectionTimeout),
+        port).withChildChannelOptions(childChannelOptions), "listener-deltaCounter-" + port);
   }
 
   @VisibleForTesting
@@ -675,52 +634,44 @@ public class PushAgent extends AbstractAgent {
     final int port = Integer.parseInt(strPort);
     registerPrefixFilter(strPort);
     registerTimestampFilter(strPort);
-    if (proxyConfig.isHttpHealthCheckAllPorts()) healthCheckManager.enableHealthcheck(port);
+    if (httpHealthCheckAllPorts) healthCheckManager.enableHealthcheck(port);
 
-    ReportableEntityHandlerFactory handlerFactoryDelegate = proxyConfig.
-        isPushRelayHistogramAggregator() ?
+    ReportableEntityHandlerFactory handlerFactoryDelegate = pushRelayHistogramAggregator ?
         new DelegatingReportableEntityHandlerFactoryImpl(handlerFactory) {
           @Override
-          public <T, U> ReportableEntityHandler<T, U> getHandler(HandlerKey handlerKey) {
+          public ReportableEntityHandler getHandler(HandlerKey handlerKey) {
             if (handlerKey.getEntityType() == ReportableEntityType.HISTOGRAM) {
               ChronicleMap<HistogramKey, AgentDigest> accumulator = ChronicleMap.
                   of(HistogramKey.class, AgentDigest.class).
                   keyMarshaller(HistogramKeyMarshaller.get()).
                   valueMarshaller(AgentDigestMarshaller.get()).
-                  entries(proxyConfig.getPushRelayHistogramAggregatorAccumulatorSize()).
-                  averageKeySize(proxyConfig.getHistogramDistAvgKeyBytes()).
-                  averageValueSize(proxyConfig.getHistogramDistAvgDigestBytes()).
+                  entries(pushRelayHistogramAggregatorAccumulatorSize).
+                  averageKeySize(histogramDistAvgKeyBytes).
+                  averageValueSize(histogramDistAvgDigestBytes).
                   maxBloatFactor(1000).
                   create();
               AgentDigestFactory agentDigestFactory = new AgentDigestFactory(
-                  proxyConfig.getPushRelayHistogramAggregatorCompression(),
-                  TimeUnit.SECONDS.toMillis(proxyConfig.getPushRelayHistogramAggregatorFlushSecs()),
-                  proxyConfig.getTimeProvider());
+                  pushRelayHistogramAggregatorCompression,
+                  TimeUnit.SECONDS.toMillis(pushRelayHistogramAggregatorFlushSecs));
               AccumulationCache cachedAccumulator = new AccumulationCache(accumulator,
                   agentDigestFactory, 0, "histogram.accumulator.distributionRelay", null);
-              //noinspection unchecked
-              return (ReportableEntityHandler<T, U>) new HistogramAccumulationHandlerImpl(
-                  handlerKey, cachedAccumulator, proxyConfig.getPushBlockedSamples(), null,
-                  validationConfiguration, true, blockedHistogramsLogger, VALID_HISTOGRAMS_LOGGER);
+              return new HistogramAccumulationHandlerImpl(handlerKey.getHandle(), cachedAccumulator,
+                  pushBlockedSamples, null, () -> validationConfiguration,
+                  true, blockedHistogramsLogger);
             }
             return delegate.getHandler(handlerKey);
           }
         } : handlerFactory;
 
-    Map<ReportableEntityType, ReportableEntityDecoder<?, ?>> filteredDecoders =
-        decoderSupplier.get().entrySet().stream().
-            filter(x -> !x.getKey().equals(ReportableEntityType.SOURCE_TAG)).
-            collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+    Map<ReportableEntityType, ReportableEntityDecoder> filteredDecoders = decoderSupplier.get().
+        entrySet().stream().filter(x -> !x.getKey().equals(ReportableEntityType.SOURCE_TAG)).
+        collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
     ChannelHandler channelHandler = new RelayPortUnificationHandler(strPort, tokenAuthenticator,
         healthCheckManager, filteredDecoders, handlerFactoryDelegate, preprocessors.get(strPort),
-        hostAnnotator,
-        () -> entityProps.get(ReportableEntityType.HISTOGRAM).isFeatureDisabled(),
-        () -> entityProps.get(ReportableEntityType.TRACE).isFeatureDisabled(),
-        () -> entityProps.get(ReportableEntityType.TRACE_SPAN_LOGS).isFeatureDisabled());
-    startAsManagedThread(port, new TcpIngester(createInitializer(channelHandler, port,
-        proxyConfig.getPushListenerMaxReceivedLength(), proxyConfig.getPushListenerHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()), port).
-        withChildChannelOptions(childChannelOptions), "listener-relay-" + port);
+        hostAnnotator, histogramDisabled::get, traceDisabled::get, spanLogsDisabled::get);
+    startAsManagedThread(new TcpIngester(createInitializer(channelHandler, strPort,
+        pushListenerMaxReceivedLength, pushListenerHttpBufferSize, listenerIdleConnectionTimeout),
+        port).withChildChannelOptions(childChannelOptions), "listener-relay-" + port);
   }
 
   protected void startLogsIngestionListener(int port, LogsIngester logsIngester) {
@@ -728,11 +679,11 @@ public class PushAgent extends AbstractAgent {
       logger.warning("Filebeat log ingestion is not compatible with HTTP authentication, ignoring");
       return;
     }
-    final Server filebeatServer = new Server("0.0.0.0", port,
-        proxyConfig.getListenerIdleConnectionTimeout(), Runtime.getRuntime().availableProcessors());
+    final Server filebeatServer = new Server("0.0.0.0", port, listenerIdleConnectionTimeout,
+        Runtime.getRuntime().availableProcessors());
     filebeatServer.setMessageListener(new FilebeatIngester(logsIngester,
         System::currentTimeMillis));
-    startAsManagedThread(port, () -> {
+    startAsManagedThread(() -> {
       try {
         activeListeners.inc();
         filebeatServer.listen();
@@ -757,27 +708,25 @@ public class PushAgent extends AbstractAgent {
   @VisibleForTesting
   protected void startRawLogsIngestionListener(int port, LogsIngester logsIngester) {
     String strPort = String.valueOf(port);
-    if (proxyConfig.isHttpHealthCheckAllPorts()) healthCheckManager.enableHealthcheck(port);
+    if (httpHealthCheckAllPorts) healthCheckManager.enableHealthcheck(port);
     ChannelHandler channelHandler = new RawLogsIngesterPortUnificationHandler(strPort, logsIngester,
         hostnameResolver, tokenAuthenticator, healthCheckManager, preprocessors.get(strPort));
 
-    startAsManagedThread(port, new TcpIngester(createInitializer(channelHandler, port,
-        proxyConfig.getRawLogsMaxReceivedLength(), proxyConfig.getRawLogsHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()), port).
-        withChildChannelOptions(childChannelOptions), "listener-logs-raw-" + port);
+    startAsManagedThread(new TcpIngester(createInitializer(channelHandler, strPort,
+        rawLogsMaxReceivedLength, rawLogsHttpBufferSize, listenerIdleConnectionTimeout), port).
+            withChildChannelOptions(childChannelOptions), "listener-logs-raw-" + port);
     logger.info("listening on port: " + strPort + " for raw logs");
   }
 
   @VisibleForTesting
   protected void startAdminListener(int port) {
     ChannelHandler channelHandler = new AdminPortUnificationHandler(tokenAuthenticator,
-        healthCheckManager, String.valueOf(port), proxyConfig.getAdminApiRemoteIpWhitelistRegex());
+        healthCheckManager, String.valueOf(port), adminApiRemoteIpWhitelistRegex);
 
-    startAsManagedThread(port,
-        new TcpIngester(createInitializer(channelHandler, port,
-        proxyConfig.getPushListenerMaxReceivedLength(), proxyConfig.getPushListenerHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()), port).
-        withChildChannelOptions(childChannelOptions), "listener-http-admin-" + port);
+    startAsManagedThread(new TcpIngester(createInitializer(channelHandler, String.valueOf(port),
+        pushListenerMaxReceivedLength, pushListenerHttpBufferSize, listenerIdleConnectionTimeout),
+            port).withChildChannelOptions(childChannelOptions),
+        "listener-http-admin-" + port);
     logger.info("Admin port: " + port);
   }
 
@@ -786,22 +735,20 @@ public class PushAgent extends AbstractAgent {
     healthCheckManager.enableHealthcheck(port);
     ChannelHandler channelHandler = new HttpHealthCheckEndpointHandler(healthCheckManager, port);
 
-    startAsManagedThread(port,
-        new TcpIngester(createInitializer(channelHandler, port,
-        proxyConfig.getPushListenerMaxReceivedLength(), proxyConfig.getPushListenerHttpBufferSize(),
-        proxyConfig.getListenerIdleConnectionTimeout()), port).
-        withChildChannelOptions(childChannelOptions), "listener-http-healthcheck-" + port);
+    startAsManagedThread(new TcpIngester(createInitializer(channelHandler, String.valueOf(port),
+        pushListenerMaxReceivedLength, pushListenerHttpBufferSize, listenerIdleConnectionTimeout),
+            port).withChildChannelOptions(childChannelOptions),
+        "listener-http-healthcheck-" + port);
     logger.info("Health check port enabled: " + port);
   }
 
-  protected void startHistogramListeners(List<String> ports,
-                                         ReportableEntityHandler<ReportPoint, String> pointHandler,
+  protected void startHistogramListeners(Iterator<String> ports,
+                                         ReportableEntityHandler<ReportPoint> pointHandler,
                                          SharedGraphiteHostAnnotator hostAnnotator,
                                          @Nullable Utils.Granularity granularity,
                                          int flushSecs, boolean memoryCacheEnabled,
                                          File baseDirectory, Long accumulatorSize, int avgKeyBytes,
                                          int avgDigestBytes, short compression, boolean persist) {
-    if (ports.size() == 0) return;
     String listenerBinType = Utils.Granularity.granularityToString(granularity);
     // Accumulator
     if (persist) {
@@ -849,7 +796,7 @@ public class PushAgent extends AbstractAgent {
         TimeUnit.SECONDS);
 
     AgentDigestFactory agentDigestFactory = new AgentDigestFactory(compression,
-        TimeUnit.SECONDS.toMillis(flushSecs), proxyConfig.getTimeProvider());
+        TimeUnit.SECONDS.toMillis(flushSecs));
     Accumulator cachedAccumulator = new AccumulationCache(accumulator, agentDigestFactory,
         (memoryCacheEnabled ? accumulatorSize : 0),
         "histogram.accumulator." + Utils.Granularity.granularityToString(granularity), null);
@@ -857,21 +804,16 @@ public class PushAgent extends AbstractAgent {
     // Schedule write-backs
     histogramExecutor.scheduleWithFixedDelay(
         cachedAccumulator::flush,
-        proxyConfig.getHistogramAccumulatorResolveInterval(),
-        proxyConfig.getHistogramAccumulatorResolveInterval(),
+        histogramAccumulatorResolveInterval,
+        histogramAccumulatorResolveInterval,
         TimeUnit.MILLISECONDS);
-    histogramFlushRunnables.add(cachedAccumulator::flush);
 
     PointHandlerDispatcher dispatcher = new PointHandlerDispatcher(cachedAccumulator, pointHandler,
-        proxyConfig.getTimeProvider(),
-        () -> entityProps.get(ReportableEntityType.HISTOGRAM).isFeatureDisabled(),
-        proxyConfig.getHistogramAccumulatorFlushMaxBatchSize() < 0 ? null :
-            proxyConfig.getHistogramAccumulatorFlushMaxBatchSize(), granularity);
+        histogramAccumulatorFlushMaxBatchSize < 0 ? null : histogramAccumulatorFlushMaxBatchSize,
+        granularity);
 
-    histogramExecutor.scheduleWithFixedDelay(dispatcher,
-        proxyConfig.getHistogramAccumulatorFlushInterval(),
-        proxyConfig.getHistogramAccumulatorFlushInterval(), TimeUnit.MILLISECONDS);
-    histogramFlushRunnables.add(dispatcher);
+    histogramExecutor.scheduleWithFixedDelay(dispatcher, histogramAccumulatorFlushInterval,
+        histogramAccumulatorFlushInterval, TimeUnit.MILLISECONDS);
 
     // gracefully shutdown persisted accumulator (ChronicleMap) on proxy exit
     shutdownTasks.add(() -> {
@@ -887,54 +829,78 @@ public class PushAgent extends AbstractAgent {
     });
 
     ReportableEntityHandlerFactory histogramHandlerFactory = new ReportableEntityHandlerFactory() {
-      private final Map<HandlerKey, ReportableEntityHandler<?, ?>> handlers = new HashMap<>();
-      @SuppressWarnings("unchecked")
-      @Override
-      public <T, U> ReportableEntityHandler<T, U> getHandler(HandlerKey handlerKey) {
-          return (ReportableEntityHandler<T, U>) handlers.computeIfAbsent(handlerKey,
-              k -> new HistogramAccumulationHandlerImpl(handlerKey, cachedAccumulator,
-                  proxyConfig.getPushBlockedSamples(), granularity, validationConfiguration,
-                  granularity == null, blockedHistogramsLogger, VALID_HISTOGRAMS_LOGGER));
-      }
-
-      @Override
-      public void shutdown(@Nonnull String handle) {
-        handlers.values().forEach(ReportableEntityHandler::shutdown);
+      private Map<HandlerKey, ReportableEntityHandler> handlers = new HashMap<>();
+        @Override
+      public ReportableEntityHandler getHandler(HandlerKey handlerKey) {
+          return handlers.computeIfAbsent(handlerKey, k -> new HistogramAccumulationHandlerImpl(
+              handlerKey.getHandle(), cachedAccumulator, pushBlockedSamples, granularity,
+              () -> validationConfiguration, granularity == null, blockedHistogramsLogger));
       }
     };
 
-    ports.forEach(strPort -> {
-      int port = Integer.parseInt(strPort);
-      registerPrefixFilter(strPort);
-      registerTimestampFilter(strPort);
-      if (proxyConfig.isHttpHealthCheckAllPorts()) {
-        healthCheckManager.enableHealthcheck(port);
-      }
+    ports.forEachRemaining(port -> {
+      registerPrefixFilter(port);
+      registerTimestampFilter(port);
+      if (httpHealthCheckAllPorts) healthCheckManager.enableHealthcheck(Integer.parseInt(port));
+
       WavefrontPortUnificationHandler wavefrontPortUnificationHandler =
-          new WavefrontPortUnificationHandler(strPort, tokenAuthenticator, healthCheckManager,
+          new WavefrontPortUnificationHandler(port, tokenAuthenticator, healthCheckManager,
               decoderSupplier.get(), histogramHandlerFactory, hostAnnotator,
-              preprocessors.get(strPort));
-      startAsManagedThread(port,
-          new TcpIngester(createInitializer(wavefrontPortUnificationHandler, port,
-          proxyConfig.getHistogramMaxReceivedLength(), proxyConfig.getHistogramHttpBufferSize(),
-          proxyConfig.getListenerIdleConnectionTimeout()), port).
-          withChildChannelOptions(childChannelOptions), "listener-histogram-" + port);
+              preprocessors.get(port));
+      startAsManagedThread(new TcpIngester(createInitializer(wavefrontPortUnificationHandler, port,
+          histogramMaxReceivedLength, histogramHttpBufferSize, listenerIdleConnectionTimeout),
+          Integer.parseInt(port)).withChildChannelOptions(childChannelOptions),
+          "listener-histogram-" + port);
       logger.info("listening on port: " + port + " for histogram samples, accumulating to the " +
           listenerBinType);
     });
 
   }
 
+  private static ChannelInitializer createInitializer(ChannelHandler channelHandler,
+                                                      String port, int messageMaxLength,
+                                                      int httpRequestBufferSize, int idleTimeout) {
+    return createInitializer(ImmutableList.of(() -> new PlainTextOrHttpFrameDecoder(channelHandler,
+        messageMaxLength, httpRequestBufferSize)), port, idleTimeout);
+  }
+
+  private static ChannelInitializer createInitializer(
+      Iterable<Supplier<ChannelHandler>> channelHandlerSuppliers, String port, int idleTimeout) {
+    ChannelHandler idleStateEventHandler = new IdleStateEventHandler(Metrics.newCounter(
+        new TaggedMetricName("listeners", "connections.idle.closed", "port", port)));
+    ChannelHandler connectionTracker = new ConnectionTrackingHandler(
+        Metrics.newCounter(new TaggedMetricName("listeners", "connections.accepted", "port",
+            port)),
+        Metrics.newCounter(new TaggedMetricName("listeners", "connections.active", "port",
+            port)));
+    return new ChannelInitializer<SocketChannel>() {
+      @Override
+      public void initChannel(SocketChannel ch) {
+        ChannelPipeline pipeline = ch.pipeline();
+
+        pipeline.addFirst("idlehandler", new IdleStateHandler(idleTimeout, 0, 0));
+        pipeline.addLast("idlestateeventhandler", idleStateEventHandler);
+        pipeline.addLast("connectiontracker", connectionTracker);
+        channelHandlerSuppliers.forEach(x -> pipeline.addLast(x.get()));
+      }
+    };
+  }
+
+  private Iterator<String> portIterator(@Nullable String inputString) {
+    return inputString == null ?
+        Collections.emptyIterator() :
+        Splitter.on(",").omitEmptyStrings().trimResults().split(inputString).iterator();
+  }
+
   private void registerTimestampFilter(String strPort) {
-    preprocessors.getSystemPreprocessor(strPort).forReportPoint().addFilter(0,
-        new ReportPointTimestampInRangeFilter(proxyConfig.getDataBackfillCutoffHours(),
-            proxyConfig.getDataPrefillCutoffHours()));
+    preprocessors.getSystemPreprocessor(strPort).forReportPoint().addFilter(
+        new ReportPointTimestampInRangeFilter(dataBackfillCutoffHours, dataPrefillCutoffHours));
   }
 
   private void registerPrefixFilter(String strPort) {
-    if (proxyConfig.getPrefix() != null && !proxyConfig.getPrefix().isEmpty()) {
+    if (prefix != null && !prefix.isEmpty()) {
       preprocessors.getSystemPreprocessor(strPort).forReportPoint().
-          addTransformer(new ReportPointAddPrefixTransformer(proxyConfig.getPrefix()));
+          addTransformer(new ReportPointAddPrefixTransformer(prefix));
     }
   }
 
@@ -946,161 +912,77 @@ public class PushAgent extends AbstractAgent {
   @Override
   protected void processConfiguration(AgentConfiguration config) {
     try {
+      agentAPI.proxyConfigProcessed(agentId);
       Long pointsPerBatch = config.getPointsPerBatch();
       if (BooleanUtils.isTrue(config.getCollectorSetsPointsPerBatch())) {
         if (pointsPerBatch != null) {
           // if the collector is in charge and it provided a setting, use it
-          entityProps.get(ReportableEntityType.POINT).setItemsPerBatch(pointsPerBatch.intValue());
+          pushFlushMaxPoints.set(pointsPerBatch.intValue());
           logger.fine("Proxy push batch set to (remotely) " + pointsPerBatch);
         } // otherwise don't change the setting
       } else {
-        // restore the original setting
-        entityProps.get(ReportableEntityType.POINT).setItemsPerBatch(null);
-        logger.fine("Proxy push batch set to (locally) " +
-            entityProps.get(ReportableEntityType.POINT).getItemsPerBatch());
+        // restores the agent setting
+        pushFlushMaxPoints.set(pushFlushMaxPointsInitialValue);
+        logger.fine("Proxy push batch set to (locally) " + pushFlushMaxPoints.get());
       }
 
-      updateRateLimiter(ReportableEntityType.POINT, config.getCollectorSetsRateLimit(),
-          config.getCollectorRateLimit(), config.getGlobalCollectorRateLimit());
-      updateRateLimiter(ReportableEntityType.HISTOGRAM, config.getCollectorSetsRateLimit(),
-          config.getHistogramRateLimit(), config.getGlobalHistogramRateLimit());
-      updateRateLimiter(ReportableEntityType.SOURCE_TAG, config.getCollectorSetsRateLimit(),
-          config.getSourceTagsRateLimit(), config.getGlobalSourceTagRateLimit());
-      updateRateLimiter(ReportableEntityType.TRACE, config.getCollectorSetsRateLimit(),
-          config.getSpanRateLimit(), config.getGlobalSpanRateLimit());
-      updateRateLimiter(ReportableEntityType.TRACE_SPAN_LOGS, config.getCollectorSetsRateLimit(),
-          config.getSpanLogsRateLimit(), config.getGlobalSpanLogsRateLimit());
-      updateRateLimiter(ReportableEntityType.EVENT, config.getCollectorSetsRateLimit(),
-          config.getEventsRateLimit(), config.getGlobalEventRateLimit());
+      if (BooleanUtils.isTrue(config.getCollectorSetsRateLimit())) {
+        Long collectorRateLimit = config.getCollectorRateLimit();
+        if (pushRateLimiter != null && collectorRateLimit != null &&
+            pushRateLimiter.getRate() != collectorRateLimit) {
+          pushRateLimiter.setRate(collectorRateLimit);
+          logger.warning("Proxy rate limit set to " + collectorRateLimit + " remotely");
+        }
+      } else {
+        if (pushRateLimiter != null && pushRateLimiter.getRate() != pushRateLimit) {
+          pushRateLimiter.setRate(pushRateLimit);
+          if (pushRateLimit >= NO_RATE_LIMIT) {
+            logger.warning("Proxy rate limit no longer enforced by remote");
+          } else {
+            logger.warning("Proxy rate limit restored to " + pushRateLimit);
+          }
+        }
+      }
 
       if (BooleanUtils.isTrue(config.getCollectorSetsRetryBackoff())) {
         if (config.getRetryBackoffBaseSeconds() != null) {
           // if the collector is in charge and it provided a setting, use it
-          entityProps.get(ReportableEntityType.POINT).
-              setRetryBackoffBaseSeconds(config.getRetryBackoffBaseSeconds());
+          retryBackoffBaseSeconds.set(config.getRetryBackoffBaseSeconds());
           logger.fine("Proxy backoff base set to (remotely) " +
               config.getRetryBackoffBaseSeconds());
         } // otherwise don't change the setting
       } else {
         // restores the agent setting
-        entityProps.get(ReportableEntityType.POINT).setRetryBackoffBaseSeconds(null);
-        logger.fine("Proxy backoff base set to (locally) " +
-            entityProps.get(ReportableEntityType.POINT).getRetryBackoffBaseSeconds());
+        retryBackoffBaseSeconds.set(retryBackoffBaseSecondsInitialValue);
+        logger.fine("Proxy backoff base set to (locally) " + retryBackoffBaseSeconds.get());
       }
-      entityProps.get(ReportableEntityType.HISTOGRAM).
-          setFeatureDisabled(config.getHistogramDisabled());
-      entityProps.get(ReportableEntityType.TRACE).
-          setFeatureDisabled(config.getTraceDisabled());
-      entityProps.get(ReportableEntityType.TRACE_SPAN_LOGS).
-          setFeatureDisabled(config.getSpanLogsDisabled());
-      validationConfiguration.updateFrom(config.getValidationConfiguration());
-      super.processConfiguration(config);
+
+      histogramDisabled.set(BooleanUtils.toBoolean(config.getHistogramDisabled()));
+      traceDisabled.set(BooleanUtils.toBoolean(config.getTraceDisabled()));
+      spanLogsDisabled.set(BooleanUtils.toBoolean(config.getSpanLogsDisabled()));
     } catch (RuntimeException e) {
       // cannot throw or else configuration update thread would die.
     }
   }
 
-  private void updateRateLimiter(ReportableEntityType entityType,
-                                 @Nullable Boolean collectorSetsRateLimit,
-                                 @Nullable Number collectorRateLimit,
-                                 @Nullable Number globalRateLimit) {
-    EntityProperties entityProperties = entityProps.get(entityType);
-    RecyclableRateLimiter rateLimiter = entityProperties.getRateLimiter();
-    if (rateLimiter != null) {
-      if (BooleanUtils.isTrue(collectorSetsRateLimit)) {
-        if (collectorRateLimit != null &&
-            rateLimiter.getRate() != collectorRateLimit.doubleValue()) {
-          rateLimiter.setRate(collectorRateLimit.doubleValue());
-          entityProperties.setItemsPerBatch(Math.min(collectorRateLimit.intValue(),
-              entityProperties.getItemsPerBatch()));
-          logger.warning(entityType.toCapitalizedString() + " rate limit set to " +
-              collectorRateLimit + entityType.getRateUnit() + " remotely");
-        }
-      } else {
-        double rateLimit = Math.min(entityProperties.getRateLimit(),
-            ObjectUtils.firstNonNull(globalRateLimit, NO_RATE_LIMIT).intValue());
-        if (rateLimiter.getRate() != rateLimit) {
-          rateLimiter.setRate(rateLimit);
-          if (entityProperties.getItemsPerBatchOriginal() > rateLimit) {
-            entityProperties.setItemsPerBatch((int) rateLimit);
-          } else {
-            entityProperties.setItemsPerBatch(null);
-          }
-          if (rateLimit >= NO_RATE_LIMIT) {
-            logger.warning(entityType.toCapitalizedString() + " rate limit is no longer " +
-                "enforced by remote");
-          } else {
-            if (proxyCheckinScheduler.getSuccessfulCheckinCount() > 1) {
-              // this will skip printing this message upon init
-              logger.warning(entityType.toCapitalizedString() + " rate limit restored to " +
-                  rateLimit + entityType.getRateUnit());
-            }
-          }
-        }
-      }
-    }
-  }
-
-  protected TokenAuthenticator configureTokenAuthenticator() {
-    HttpClient httpClient = HttpClientBuilder.create().
-        useSystemProperties().
-        setUserAgent(proxyConfig.getHttpUserAgent()).
-        setMaxConnPerRoute(10).
-        setMaxConnTotal(10).
-        setConnectionTimeToLive(1, TimeUnit.MINUTES).
-        setRetryHandler(new DefaultHttpRequestRetryHandler(proxyConfig.getHttpAutoRetries(), true)).
-        setDefaultRequestConfig(
-            RequestConfig.custom().
-                setContentCompressionEnabled(true).
-                setRedirectsEnabled(true).
-                setConnectTimeout(proxyConfig.getHttpConnectTimeout()).
-                setConnectionRequestTimeout(proxyConfig.getHttpConnectTimeout()).
-                setSocketTimeout(proxyConfig.getHttpRequestTimeout()).build()).
-        build();
-    return TokenAuthenticatorBuilder.create().
-        setTokenValidationMethod(proxyConfig.getAuthMethod()).
-        setHttpClient(httpClient).
-        setTokenIntrospectionServiceUrl(proxyConfig.getAuthTokenIntrospectionServiceUrl()).
-        setTokenIntrospectionAuthorizationHeader(
-            proxyConfig.getAuthTokenIntrospectionAuthorizationHeader()).
-        setAuthResponseRefreshInterval(proxyConfig.getAuthResponseRefreshInterval()).
-        setAuthResponseMaxTtl(proxyConfig.getAuthResponseMaxTtl()).
-        setStaticToken(proxyConfig.getAuthStaticToken()).
-        build();
-  }
-
-  protected void startAsManagedThread(int port, Runnable target, @Nullable String threadName) {
+  protected void startAsManagedThread(Runnable target, @Nullable String threadName) {
     Thread thread = new Thread(target);
     if (threadName != null) {
       thread.setName(threadName);
     }
-    listeners.put(port, thread);
+    managedThreads.add(thread);
     thread.start();
   }
 
   @Override
   public void stopListeners() {
-    listeners.values().forEach(Thread::interrupt);
-    listeners.values().forEach(thread -> {
+    managedThreads.forEach(Thread::interrupt);
+    managedThreads.forEach(thread -> {
       try {
         thread.join(TimeUnit.SECONDS.toMillis(10));
       } catch (InterruptedException e) {
         // ignore
       }
     });
-  }
-
-  @Override
-  protected void stopListener(int port) {
-    Thread listener = listeners.remove(port);
-    if (listener == null) return;
-    listener.interrupt();
-    try {
-      listener.join(TimeUnit.SECONDS.toMillis(10));
-    } catch (InterruptedException e) {
-      // ignore
-    }
-    handlerFactory.shutdown(String.valueOf(port));
-    senderTaskFactory.shutdown(String.valueOf(port));
   }
 }

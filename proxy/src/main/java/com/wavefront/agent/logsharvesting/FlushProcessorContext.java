@@ -14,15 +14,14 @@ import wavefront.report.TimeSeries;
  */
 public class FlushProcessorContext {
   private final long timestamp;
-  private final TimeSeries timeSeries;
-  private final Supplier<ReportableEntityHandler<ReportPoint, String>> pointHandlerSupplier;
-  private final Supplier<ReportableEntityHandler<ReportPoint, String>> histogramHandlerSupplier;
-  private final String prefix;
+  private TimeSeries timeSeries;
+  private final Supplier<ReportableEntityHandler<ReportPoint>> pointHandlerSupplier;
+  private final Supplier<ReportableEntityHandler<ReportPoint>> histogramHandlerSupplier;
+  private String prefix;
 
-  FlushProcessorContext(
-      TimeSeries timeSeries, String prefix,
-      Supplier<ReportableEntityHandler<ReportPoint, String>> pointHandlerSupplier,
-      Supplier<ReportableEntityHandler<ReportPoint, String>> histogramHandlerSupplier) {
+  FlushProcessorContext(TimeSeries timeSeries, String prefix,
+                        Supplier<ReportableEntityHandler<ReportPoint>> pointHandlerSupplier,
+                        Supplier<ReportableEntityHandler<ReportPoint>> histogramHandlerSupplier) {
     this.timeSeries = TimeSeries.newBuilder(timeSeries).build();
     this.prefix = prefix;
     this.pointHandlerSupplier = pointHandlerSupplier;

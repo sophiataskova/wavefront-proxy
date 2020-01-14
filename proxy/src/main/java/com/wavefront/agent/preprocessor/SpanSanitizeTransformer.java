@@ -4,7 +4,7 @@ import com.google.common.base.Function;
 import wavefront.report.Annotation;
 import wavefront.report.Span;
 
-import javax.annotation.Nullable;
+import javax.annotation.Nonnull;
 
 import static com.wavefront.sdk.common.Utils.sanitizeWithoutQuotes;
 
@@ -22,8 +22,7 @@ public class SpanSanitizeTransformer implements Function<Span, Span> {
   }
 
   @Override
-  public Span apply(@Nullable Span span) {
-    if (span == null) return null;
+  public Span apply(@Nonnull Span span) {
     long startNanos = ruleMetrics.ruleStart();
     boolean ruleApplied = false;
 
@@ -31,7 +30,7 @@ public class SpanSanitizeTransformer implements Function<Span, Span> {
     String name = span.getName();
     if (name != null) {
       span.setName(sanitizeValue(name).replace('*', '-'));
-      if (!span.getName().equals(name)) {
+      if (span.getName().equals(name)) {
         ruleApplied = true;
       }
     }
@@ -40,7 +39,7 @@ public class SpanSanitizeTransformer implements Function<Span, Span> {
     String source = span.getSource();
     if (source != null) {
       span.setSource(sanitizeWithoutQuotes(source));
-      if (!span.getSource().equals(source)) {
+      if (!ruleApplied && !span.getSource().equals(source)) {
         ruleApplied = true;
       }
     }
@@ -51,7 +50,7 @@ public class SpanSanitizeTransformer implements Function<Span, Span> {
         String key = a.getKey();
         if (key != null) {
           a.setKey(sanitizeWithoutQuotes(key));
-          if (!a.getKey().equals(key)) {
+          if (!ruleApplied && !a.getKey().equals(key)) {
             ruleApplied = true;
           }
         }
@@ -60,7 +59,7 @@ public class SpanSanitizeTransformer implements Function<Span, Span> {
         String value = a.getValue();
         if (value != null) {
           a.setValue(sanitizeValue(value));
-          if (!a.getValue().equals(value)) {
+          if (!ruleApplied && !a.getValue().equals(value)) {
             ruleApplied = true;
           }
         }

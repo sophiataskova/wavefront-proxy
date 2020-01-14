@@ -1,10 +1,12 @@
 package com.wavefront.agent.histogram;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Preconditions;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+
 import net.openhft.chronicle.hash.serialization.BytesReader;
 import net.openhft.chronicle.hash.serialization.BytesWriter;
 import net.openhft.chronicle.hash.serialization.SizedReader;
@@ -12,14 +14,17 @@ import net.openhft.chronicle.hash.serialization.SizedWriter;
 import net.openhft.chronicle.map.ChronicleMap;
 import net.openhft.chronicle.map.VanillaChronicleMap;
 
-import javax.annotation.Nonnull;
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.io.Reader;
 import java.io.Writer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
+import javax.validation.constraints.NotNull;
 
 /**
  * Loader for {@link ChronicleMap}. If a file already exists at the given location, will make an attempt to load the map
@@ -37,8 +42,6 @@ public class MapLoader<K, V, KM extends BytesReader<K> & BytesWriter<K>, VM exte
    * crashes at all costs.
    */
   private static final double MAX_BLOAT_FACTOR = 1000;
-
-  private static final ObjectMapper JSON_PARSER = new ObjectMapper();
 
   private final Class<K> keyClass;
   private final Class<V> valueClass;
@@ -74,17 +77,22 @@ public class MapLoader<K, V, KM extends BytesReader<K> & BytesWriter<K>, VM exte
         }
 
         private MapSettings loadSettings(File file) throws IOException {
-          return JSON_PARSER.readValue(new FileReader(file), MapSettings.class);
+          Gson gson = new GsonBuilder().
+              registerTypeHierarchyAdapter(Class.class, new MapSettings.ClassNameSerializer()).create();
+          Reader br = new BufferedReader(new FileReader(file));
+          return gson.fromJson(br, MapSettings.class);
         }
 
         private void saveSettings(MapSettings settings, File file) throws IOException {
+          Gson gson = new GsonBuilder().
+              registerTypeHierarchyAdapter(Class.class, new MapSettings.ClassNameSerializer()).create();
           Writer writer = new FileWriter(file);
-          JSON_PARSER.writeValue(writer, settings);
+          gson.toJson(settings, writer);
           writer.close();
         }
 
         @Override
-        public ChronicleMap<K, V> load(@Nonnull File file) {
+        public ChronicleMap<K, V> load(@NotNull File file) throws Exception {
           if (!doPersist) {
             logger.log(
                 Level.WARNING,
@@ -93,7 +101,8 @@ public class MapLoader<K, V, KM extends BytesReader<K> & BytesWriter<K>, VM exte
             return newInMemoryMap();
           }
 
-          MapSettings newSettings = new MapSettings(entries, avgKeySize, avgValueSize);
+          MapSettings newSettings = new MapSettings(keyClass, valueClass,
+              keyMarshaller.getClass(), valueMarshaller.getClass(), entries, avgKeySize, avgValueSize);
           File settingsFile = new File(file.getAbsolutePath().concat(".settings"));
           try {
             if (file.exists()) {
@@ -104,10 +113,8 @@ public class MapLoader<K, V, KM extends BytesReader<K> & BytesWriter<K>, VM exte
                   File originalFile = new File(file.getAbsolutePath());
                   File oldFile = new File(file.getAbsolutePath().concat(".temp"));
                   if (oldFile.exists()) {
-                    //noinspection ResultOfMethodCallIgnored
                     oldFile.delete();
                   }
-                  //noinspection ResultOfMethodCallIgnored
                   file.renameTo(oldFile);
 
                   ChronicleMap<K, V> toMigrate = ChronicleMap
@@ -129,7 +136,6 @@ public class MapLoader<K, V, KM extends BytesReader<K> & BytesWriter<K>, VM exte
                   }
 
                   saveSettings(newSettings, settingsFile);
-                  //noinspection ResultOfMethodCallIgnored
                   oldFile.delete();
                   logger.info(originalFile.getName() + " reconfiguration finished");
 
@@ -149,7 +155,6 @@ public class MapLoader<K, V, KM extends BytesReader<K> & BytesWriter<K>, VM exte
               if (result.isEmpty()) {
                 // Create a new map with the supplied settings to be safe.
                 result.close();
-                //noinspection ResultOfMethodCallIgnored
                 file.delete();
                 logger.fine("Empty accumulator - reinitializing: " + file.getName());
                 result = newPersistedMap(file);

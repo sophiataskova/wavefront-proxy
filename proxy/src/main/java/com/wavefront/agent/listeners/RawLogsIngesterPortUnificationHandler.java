@@ -26,7 +26,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.DecoderException;
 import io.netty.handler.codec.TooLongFrameException;
 
-import static com.wavefront.agent.channel.ChannelUtils.getRemoteAddress;
+import static com.wavefront.agent.channel.CachingHostnameLookupResolver.getRemoteAddress;
 
 /**
  * Process incoming logs in raw plaintext format.
@@ -58,8 +58,8 @@ public class RawLogsIngesterPortUnificationHandler extends AbstractLineDelimited
   public RawLogsIngesterPortUnificationHandler(
       String handle, @Nonnull LogsIngester ingester,
       @Nonnull Function<InetAddress, String> hostnameResolver,
-      @Nullable TokenAuthenticator authenticator,
-      @Nullable HealthCheckManager healthCheckManager,
+      @Nonnull TokenAuthenticator authenticator,
+      @Nonnull HealthCheckManager healthCheckManager,
       @Nullable Supplier<ReportableEntityPreprocessor> preprocessor) {
     super(authenticator, healthCheckManager, handle);
     this.logsIngester = ingester;

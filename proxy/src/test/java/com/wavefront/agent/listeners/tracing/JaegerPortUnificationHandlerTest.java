@@ -38,9 +38,9 @@ import static org.easymock.EasyMock.verify;
  */
 public class JaegerPortUnificationHandlerTest {
   private final static String DEFAULT_SOURCE = "jaeger";
-  private ReportableEntityHandler<Span, String> mockTraceHandler =
+  private ReportableEntityHandler<Span> mockTraceHandler =
       MockReportableEntityHandlerFactory.getMockTraceHandler();
-  private ReportableEntityHandler<SpanLogs, String> mockTraceSpanLogsHandler =
+  private ReportableEntityHandler<SpanLogs> mockTraceSpanLogsHandler =
       MockReportableEntityHandlerFactory.getMockTraceSpanLogsHandler();
   private ChannelHandlerContext mockCtx = createNiceMock(ChannelHandlerContext.class);
 

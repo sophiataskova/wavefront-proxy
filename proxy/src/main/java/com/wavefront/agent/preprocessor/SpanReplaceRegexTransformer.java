@@ -71,10 +71,8 @@ public class SpanReplaceRegexTransformer implements Function<Span, Span> {
     return content;
   }
 
-  @Nullable
   @Override
-  public Span apply(@Nullable Span span) {
-    if (span == null) return null;
+  public Span apply(@Nonnull Span span) {
     long startNanos = ruleMetrics.ruleStart();
     switch (scope) {
       case "spanName":

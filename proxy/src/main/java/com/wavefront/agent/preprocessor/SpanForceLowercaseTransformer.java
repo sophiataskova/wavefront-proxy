@@ -5,6 +5,7 @@ import com.google.common.base.Preconditions;
 
 import java.util.regex.Pattern;
 
+import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import wavefront.report.Annotation;
@@ -36,10 +37,8 @@ public class SpanForceLowercaseTransformer implements Function<Span, Span> {
     this.ruleMetrics = ruleMetrics;
   }
 
-  @Nullable
   @Override
-  public Span apply(@Nullable Span span) {
-    if (span == null) return null;
+  public Span apply(@Nonnull Span span) {
     long startNanos = ruleMetrics.ruleStart();
     switch (scope) {
       case "spanName":

@@ -3,6 +3,8 @@ package com.wavefront.agent.listeners;
 import com.wavefront.agent.auth.TokenAuthenticatorBuilder;
 import com.wavefront.agent.channel.HealthCheckManager;
 
+import java.util.logging.Logger;
+
 import javax.annotation.Nullable;
 
 import io.netty.channel.ChannelHandler;
@@ -19,6 +21,8 @@ import static com.wavefront.agent.channel.ChannelUtils.writeHttpResponse;
  */
 @ChannelHandler.Sharable
 public class HttpHealthCheckEndpointHandler extends AbstractHttpOnlyHandler {
+  private static final Logger log = Logger.getLogger(
+      HttpHealthCheckEndpointHandler.class.getCanonicalName());
 
   public HttpHealthCheckEndpointHandler(@Nullable final HealthCheckManager healthCheckManager,
                                         int port) {

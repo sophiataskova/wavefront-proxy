@@ -1,6 +1,7 @@
 package com.wavefront.agent.listeners;
 
 import com.wavefront.agent.auth.TokenAuthenticator;
+import com.wavefront.agent.channel.ChannelUtils;
 import com.wavefront.agent.channel.HealthCheckManager;
 
 import org.apache.commons.lang.StringUtils;
@@ -8,11 +9,11 @@ import org.apache.commons.lang.math.NumberUtils;
 
 import java.net.InetSocketAddress;
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import io.netty.channel.ChannelHandler;
@@ -40,7 +41,7 @@ public class AdminPortUnificationHandler extends AbstractHttpOnlyHandler {
   private static final Logger logger = Logger.getLogger(
       AdminPortUnificationHandler.class.getCanonicalName());
 
-  private static final Pattern PATH = Pattern.compile("/(enable|disable|status)/?(\\d*)/?");
+  private static Pattern PATH = Pattern.compile("/(enable|disable|status)/?(\\d*)/?");
 
   private final String remoteIpWhitelistRegex;
 
@@ -51,7 +52,7 @@ public class AdminPortUnificationHandler extends AbstractHttpOnlyHandler {
    * @param healthCheckManager shared health check endpoint handler.
    * @param handle             handle/port number.
    */
-  public AdminPortUnificationHandler(@Nullable TokenAuthenticator tokenAuthenticator,
+  public AdminPortUnificationHandler(@Nonnull TokenAuthenticator tokenAuthenticator,
                                      @Nullable HealthCheckManager healthCheckManager,
                                      @Nullable String handle,
                                      @Nullable String remoteIpWhitelistRegex) {
@@ -61,7 +62,7 @@ public class AdminPortUnificationHandler extends AbstractHttpOnlyHandler {
 
   @Override
   protected void handleHttpMessage(final ChannelHandlerContext ctx,
-                                   final FullHttpRequest request) throws URISyntaxException {
+                                   final FullHttpRequest request) {
     StringBuilder output = new StringBuilder();
     String remoteIp = ((InetSocketAddress) ctx.channel().remoteAddress()).getAddress().
         getHostAddress();
@@ -72,7 +73,8 @@ public class AdminPortUnificationHandler extends AbstractHttpOnlyHandler {
       writeHttpResponse(ctx, HttpResponseStatus.UNAUTHORIZED, output, request);
       return;
     }
-    URI uri = new URI(request.uri());
+    URI uri = ChannelUtils.parseUri(ctx, request);
+    if (uri == null) return;
     HttpResponseStatus status;
     Matcher path = PATH.matcher(uri.getPath());
     if (path.matches()) {

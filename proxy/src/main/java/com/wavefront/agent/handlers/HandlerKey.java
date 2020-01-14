@@ -2,8 +2,7 @@ package com.wavefront.agent.handlers;
 
 import com.wavefront.data.ReportableEntityType;
 
-import javax.annotation.Nonnull;
-import java.util.Objects;
+import javax.validation.constraints.NotNull;
 
 /**
  * An immutable unique identifier for a handler pipeline (type of objects handled + port/handle name)
@@ -12,10 +11,10 @@ import java.util.Objects;
  */
 public class HandlerKey {
   private final ReportableEntityType entityType;
-  @Nonnull
+  @NotNull
   private final String handle;
 
-  private HandlerKey(ReportableEntityType entityType, @Nonnull String handle) {
+  private HandlerKey(ReportableEntityType entityType, @NotNull String handle) {
     this.entityType = entityType;
     this.handle = handle;
   }
@@ -24,18 +23,12 @@ public class HandlerKey {
     return entityType;
   }
 
-  @Nonnull
   public String getHandle() {
     return handle;
   }
 
-  public static HandlerKey of(ReportableEntityType entityType, @Nonnull String handle) {
+  public static HandlerKey of(ReportableEntityType entityType, @NotNull String handle) {
     return new HandlerKey(entityType, handle);
-  }
-
-  @Override
-  public int hashCode() {
-    return 31 * entityType.hashCode() + handle.hashCode();
   }
 
   @Override
@@ -44,12 +37,13 @@ public class HandlerKey {
     if (o == null || getClass() != o.getClass()) return false;
     HandlerKey that = (HandlerKey) o;
     if (!entityType.equals(that.entityType)) return false;
-    if (!Objects.equals(handle, that.handle)) return false;
+    if (handle != null ? !handle.equals(that.handle) : that.handle != null) return false;
     return true;
   }
 
   @Override
   public String toString() {
-    return this.entityType + "." + this.handle;
+    return "HandlerKey{entityType=" + this.entityType + ", handle=" + this.handle + "}";
   }
+
 }

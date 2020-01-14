@@ -1,25 +1,22 @@
 package com.wavefront.agent.preprocessor;
 
-import com.google.common.base.Charsets;
 import com.google.common.collect.Lists;
 
-import com.google.common.io.Files;
 import com.wavefront.ingester.GraphiteDecoder;
 
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
+import java.lang.reflect.InvocationTargetException;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.concurrent.TimeUnit;
 
 import wavefront.report.ReportPoint;
 
@@ -41,121 +38,86 @@ public class PreprocessorRulesTest {
   @BeforeClass
   public static void setup() throws IOException {
     InputStream stream = PreprocessorRulesTest.class.getResourceAsStream("preprocessor_rules.yaml");
-    config = new PreprocessorConfigManager();
-    config.loadFromStream(stream);
+    config = new PreprocessorConfigManager(null, stream, System::currentTimeMillis);
   }
 
   @Test
-  public void testPreprocessorRulesHotReload() throws Exception {
-    PreprocessorConfigManager config = new PreprocessorConfigManager();
-    String path = File.createTempFile("proxyPreprocessorRulesFile", null).getPath();
-    File file = new File(path);
-    InputStream stream = PreprocessorRulesTest.class.getResourceAsStream("preprocessor_rules.yaml");
-    Files.asCharSink(file, Charsets.UTF_8).writeFrom(new InputStreamReader(stream));
-    config.loadFile(path);
-    ReportableEntityPreprocessor preprocessor = config.get("2878").get();
-    assertEquals(1, preprocessor.forPointLine().getFilters().size());
-    assertEquals(1, preprocessor.forPointLine().getTransformers().size());
-    assertEquals(3, preprocessor.forReportPoint().getFilters().size());
-    assertEquals(8, preprocessor.forReportPoint().getTransformers().size());
-    config.loadFileIfModified(path); // should be no changes
-    preprocessor = config.get("2878").get();
-    assertEquals(1, preprocessor.forPointLine().getFilters().size());
-    assertEquals(1, preprocessor.forPointLine().getTransformers().size());
-    assertEquals(3, preprocessor.forReportPoint().getFilters().size());
-    assertEquals(8, preprocessor.forReportPoint().getTransformers().size());
-    stream = PreprocessorRulesTest.class.getResourceAsStream("preprocessor_rules_reload.yaml");
-    Files.asCharSink(file, Charsets.UTF_8).writeFrom(new InputStreamReader(stream));
-    // this is only needed for JDK8. JDK8 has second-level precision of lastModified,
-    // in JDK11 lastModified is in millis.
-    file.setLastModified((file.lastModified() / 1000 + 1) * 1000);
-    config.loadFileIfModified(path); // reload should've happened
-    preprocessor = config.get("2878").get();
-    assertEquals(0, preprocessor.forPointLine().getFilters().size());
-    assertEquals(2, preprocessor.forPointLine().getTransformers().size());
-    assertEquals(1, preprocessor.forReportPoint().getFilters().size());
-    assertEquals(3, preprocessor.forReportPoint().getTransformers().size());
-    config.setUpConfigFileMonitoring(path, 1000);
-  }
+  public void testPointInRangeCorrectForTimeRanges() throws NoSuchMethodException, InvocationTargetException,
+      IllegalAccessException {
 
-  @Test
-  public void testPointInRangeCorrectForTimeRanges() {
     long millisPerYear = 31536000000L;
     long millisPerDay = 86400000L;
     long millisPerHour = 3600000L;
 
-    long time = System.currentTimeMillis();
-    AnnotatedPredicate<ReportPoint> pointInRange1year = new ReportPointTimestampInRangeFilter(8760,
-        24, () -> time);
+    AnnotatedPredicate<ReportPoint> pointInRange1year = new ReportPointTimestampInRangeFilter(8760, 24);
+
     // not in range if over a year ago
-    ReportPoint rp = new ReportPoint("some metric", time - millisPerYear, 10L, "host", "table",
+    ReportPoint rp = new ReportPoint("some metric", System.currentTimeMillis() - millisPerYear, 10L, "host", "table",
         new HashMap<>());
     Assert.assertFalse(pointInRange1year.test(rp));
 
-    rp.setTimestamp(time - millisPerYear - 1);
+    rp.setTimestamp(System.currentTimeMillis() - millisPerYear - 1);
     Assert.assertFalse(pointInRange1year.test(rp));
 
     // in range if within a year ago
-    rp.setTimestamp(time - (millisPerYear / 2));
+    rp.setTimestamp(System.currentTimeMillis() - (millisPerYear / 2));
     Assert.assertTrue(pointInRange1year.test(rp));
 
     // in range for right now
-    rp.setTimestamp(time);
+    rp.setTimestamp(System.currentTimeMillis());
     Assert.assertTrue(pointInRange1year.test(rp));
 
     // in range if within a day in the future
-    rp.setTimestamp(time + millisPerDay - 1);
+    rp.setTimestamp(System.currentTimeMillis() + millisPerDay - 1);
     Assert.assertTrue(pointInRange1year.test(rp));
 
     // out of range for over a day in the future
-    rp.setTimestamp(time + (millisPerDay * 2));
+    rp.setTimestamp(System.currentTimeMillis() + (millisPerDay * 2));
     Assert.assertFalse(pointInRange1year.test(rp));
 
     // now test with 1 day limit
-    AnnotatedPredicate<ReportPoint> pointInRange1day = new ReportPointTimestampInRangeFilter(24,
-        24, () -> time);
+    AnnotatedPredicate<ReportPoint> pointInRange1day = new ReportPointTimestampInRangeFilter(24, 24);
 
-    rp.setTimestamp(time - millisPerDay - 1);
+    rp.setTimestamp(System.currentTimeMillis() - millisPerDay - 1);
     Assert.assertFalse(pointInRange1day.test(rp));
 
     // in range if within 1 day ago
-    rp.setTimestamp(time - (millisPerDay / 2));
+    rp.setTimestamp(System.currentTimeMillis() - (millisPerDay / 2));
     Assert.assertTrue(pointInRange1day.test(rp));
 
     // in range for right now
-    rp.setTimestamp(time);
+    rp.setTimestamp(System.currentTimeMillis());
     Assert.assertTrue(pointInRange1day.test(rp));
 
     // assert for future range within 12 hours
-    AnnotatedPredicate<ReportPoint> pointInRange12hours = new ReportPointTimestampInRangeFilter(12,
-        12, () -> time);
+    AnnotatedPredicate<ReportPoint> pointInRange12hours = new ReportPointTimestampInRangeFilter(12, 12);
 
-    rp.setTimestamp(time + (millisPerHour * 10));
+    rp.setTimestamp(System.currentTimeMillis() + (millisPerHour * 10));
     Assert.assertTrue(pointInRange12hours.test(rp));
 
-    rp.setTimestamp(time - (millisPerHour * 10));
+    rp.setTimestamp(System.currentTimeMillis() - (millisPerHour * 10));
     Assert.assertTrue(pointInRange12hours.test(rp));
 
-    rp.setTimestamp(time + (millisPerHour * 20));
+    rp.setTimestamp(System.currentTimeMillis() + (millisPerHour * 20));
     Assert.assertFalse(pointInRange12hours.test(rp));
 
-    rp.setTimestamp(time - (millisPerHour * 20));
+    rp.setTimestamp(System.currentTimeMillis() - (millisPerHour * 20));
     Assert.assertFalse(pointInRange12hours.test(rp));
 
-    AnnotatedPredicate<ReportPoint> pointInRange10Days = new ReportPointTimestampInRangeFilter(240,
-        240, () -> time);
+    AnnotatedPredicate<ReportPoint> pointInRange10Days = new ReportPointTimestampInRangeFilter(240, 240);
 
-    rp.setTimestamp(time + (millisPerDay * 9));
+    rp.setTimestamp(System.currentTimeMillis() + (millisPerDay * 9));
     Assert.assertTrue(pointInRange10Days.test(rp));
 
-    rp.setTimestamp(time - (millisPerDay * 9));
+    rp.setTimestamp(System.currentTimeMillis() - (millisPerDay * 9));
     Assert.assertTrue(pointInRange10Days.test(rp));
 
-    rp.setTimestamp(time + (millisPerDay * 20));
+    rp.setTimestamp(System.currentTimeMillis() + (millisPerDay * 20));
     Assert.assertFalse(pointInRange10Days.test(rp));
 
-    rp.setTimestamp(time - (millisPerDay * 20));
+    rp.setTimestamp(System.currentTimeMillis() - (millisPerDay * 20));
     Assert.assertFalse(pointInRange10Days.test(rp));
+
   }
 
   @Test(expected = NullPointerException.class)
@@ -339,11 +301,10 @@ public class PreprocessorRulesTest {
 
     // replace regex in a point tag value with placeholders
     // try to substitute sourceName, a point tag value and a non-existent point tag
-    new ReportPointReplaceRegexTransformer("qux", "az",
-        "{{foo}}-{{no_match}}-g{{sourceName}}-{{metricName}}-{{}}", null, null, metrics).apply(point);
+    new ReportPointReplaceRegexTransformer("qux", "az", "{{foo}}-{{no_match}}-g{{sourceName}}", null, null, metrics)
+        .apply(point);
     String expectedPoint11 =
-        "\"prefix.s0me metric\" 10.0 1469751813 source=\"h0st\" \"foo\"=\"zaz\" " +
-            "\"qux\"=\"bzaz-{{no_match}}-gh0st-prefix.s0me metric-{{}}\"";
+        "\"prefix.s0me metric\" 10.0 1469751813 source=\"h0st\" \"foo\"=\"zaz\" \"qux\"=\"bzaz-{{no_match}}-gh0st\"";
     assertEquals(expectedPoint11, referencePointToStringImpl(point));
 
   }
@@ -520,15 +481,6 @@ public class PreprocessorRulesTest {
     rule = new ReportPointLimitLengthTransformer("bar", 10, LengthLimitActionType.DROP, ".*456.*", metrics);
     point = rule.apply(parsePointLine(pointLine));
     assertNull(point.getAnnotations().get("bar"));
-  }
-
-  @Test
-  public void testPreprocessorUtil() {
-    assertEquals("input", PreprocessorUtil.truncate("input", 1, LengthLimitActionType.DROP));
-    assertEquals("input...", PreprocessorUtil.truncate("inputInput", 8,
-        LengthLimitActionType.TRUNCATE_WITH_ELLIPSIS));
-    assertEquals("inputI", PreprocessorUtil.truncate("inputInput", 6,
-        LengthLimitActionType.TRUNCATE));
   }
 
   private boolean applyAllFilters(String pointLine, String strPort) {

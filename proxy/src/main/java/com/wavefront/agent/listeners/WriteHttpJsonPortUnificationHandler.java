@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import com.wavefront.agent.auth.TokenAuthenticator;
+import com.wavefront.agent.channel.ChannelUtils;
 import com.wavefront.agent.channel.HealthCheckManager;
 import com.wavefront.agent.handlers.HandlerKey;
 import com.wavefront.agent.handlers.ReportableEntityHandler;
@@ -16,6 +17,7 @@ import com.wavefront.data.ReportableEntityType;
 import com.wavefront.ingester.GraphiteDecoder;
 import com.wavefront.ingester.ReportPointSerializer;
 
+import java.net.URI;
 import java.util.Collections;
 import java.util.List;
 import java.util.function.Supplier;
@@ -31,7 +33,7 @@ import io.netty.util.CharsetUtil;
 
 import wavefront.report.ReportPoint;
 
-import static com.wavefront.agent.channel.ChannelUtils.errorMessageWithRootCause;
+import static com.wavefront.agent.channel.ChannelUtils.writeExceptionText;
 import static com.wavefront.agent.channel.ChannelUtils.writeHttpResponse;
 
 /**
@@ -48,7 +50,7 @@ public class WriteHttpJsonPortUnificationHandler extends AbstractHttpOnlyHandler
   /**
    * The point handler that takes report metrics one data point at a time and handles batching and retries, etc
    */
-  private final ReportableEntityHandler<ReportPoint, String> pointHandler;
+  private final ReportableEntityHandler<ReportPoint> pointHandler;
   private final String defaultHost;
 
   @Nullable
@@ -68,6 +70,7 @@ public class WriteHttpJsonPortUnificationHandler extends AbstractHttpOnlyHandler
    * @param defaultHost        default host name to use, if none specified.
    * @param preprocessor       preprocessor.
    */
+  @SuppressWarnings("unchecked")
   public WriteHttpJsonPortUnificationHandler(
       final String handle, final TokenAuthenticator authenticator,
       final HealthCheckManager healthCheckManager,
@@ -81,7 +84,7 @@ public class WriteHttpJsonPortUnificationHandler extends AbstractHttpOnlyHandler
   protected WriteHttpJsonPortUnificationHandler(
       final String handle, final TokenAuthenticator authenticator,
       final HealthCheckManager healthCheckManager,
-      final ReportableEntityHandler<ReportPoint, String> pointHandler, final String defaultHost,
+      final ReportableEntityHandler<ReportPoint> pointHandler, final String defaultHost,
       @Nullable final Supplier<ReportableEntityPreprocessor> preprocessor) {
     super(authenticator, healthCheckManager, handle);
     this.pointHandler = pointHandler;
@@ -92,24 +95,29 @@ public class WriteHttpJsonPortUnificationHandler extends AbstractHttpOnlyHandler
 
   @Override
   protected void handleHttpMessage(final ChannelHandlerContext ctx,
-                                   final FullHttpRequest request) {
+                                   final FullHttpRequest incomingRequest) {
+    StringBuilder output = new StringBuilder();
+    URI uri = ChannelUtils.parseUri(ctx, incomingRequest);
+    if (uri == null) return;
+
     HttpResponseStatus status = HttpResponseStatus.OK;
-    String requestBody = request.content().toString(CharsetUtil.UTF_8);
+    String requestBody = incomingRequest.content().toString(CharsetUtil.UTF_8);
     try {
       JsonNode metrics = jsonParser.readTree(requestBody);
       if (!metrics.isArray()) {
         logger.warning("metrics is not an array!");
         pointHandler.reject((ReportPoint) null, "[metrics] is not an array!");
         status = HttpResponseStatus.BAD_REQUEST;
-        writeHttpResponse(ctx, status, "", request);
+        writeHttpResponse(ctx, status, output, incomingRequest);
         return;
       }
       reportMetrics(metrics);
-      writeHttpResponse(ctx, status, "", request);
+      writeHttpResponse(ctx, status, output, incomingRequest);
     } catch (Exception e) {
       status = HttpResponseStatus.BAD_REQUEST;
+      writeExceptionText(e, output);
       logWarning("WF-300: Failed to handle incoming write_http request", e, ctx);
-      writeHttpResponse(ctx, status, errorMessageWithRootCause(e), request);
+      writeHttpResponse(ctx, status, output, incomingRequest);
     }
   }
 
@@ -153,7 +161,7 @@ public class WriteHttpJsonPortUnificationHandler extends AbstractHttpOnlyHandler
         } else {
           builder.setValue(value.asLong());
         }
-        List<ReportPoint> parsedPoints = Lists.newArrayListWithCapacity(1);
+        List<ReportPoint> parsedPoints = Lists.newArrayListWithExpectedSize(1);
         ReportPoint point = builder.build();
         if (preprocessor != null && preprocessor.forPointLine().getTransformers().size() > 0) {
           //
@@ -211,8 +219,24 @@ public class WriteHttpJsonPortUnificationHandler extends AbstractHttpOnlyHandler
     }
 
     StringBuilder sb = new StringBuilder();
-    extractMetricFragment(plugin, plugin_instance, sb);
-    extractMetricFragment(type, type_instance, sb);
+    sb.append(plugin.textValue());
+    sb.append('.');
+    if (plugin_instance != null) {
+      String value = plugin_instance.textValue();
+      if (value != null && !value.isEmpty()) {
+        sb.append(value);
+        sb.append('.');
+      }
+    }
+    sb.append(type.textValue());
+    sb.append('.');
+    if (type_instance != null) {
+      String value = type_instance.textValue();
+      if (value != null && !value.isEmpty()) {
+        sb.append(value);
+        sb.append('.');
+      }
+    }
 
     JsonNode dsnames = metric.get("dsnames");
     if (dsnames == null || !dsnames.isArray() || dsnames.size() <= index) {
@@ -220,18 +244,5 @@ public class WriteHttpJsonPortUnificationHandler extends AbstractHttpOnlyHandler
     }
     sb.append(dsnames.get(index).textValue());
     return sb.toString();
-  }
-
-  private static void extractMetricFragment(JsonNode node, JsonNode instance_node,
-                                            StringBuilder sb) {
-    sb.append(node.textValue());
-    sb.append('.');
-    if (instance_node != null) {
-      String value = instance_node.textValue();
-      if (value != null && !value.isEmpty()) {
-        sb.append(value);
-        sb.append('.');
-      }
-    }
   }
 }

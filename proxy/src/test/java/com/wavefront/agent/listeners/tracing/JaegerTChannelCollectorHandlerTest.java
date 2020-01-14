@@ -29,9 +29,9 @@ import static org.easymock.EasyMock.verify;
 
 public class JaegerTChannelCollectorHandlerTest {
   private final static String DEFAULT_SOURCE = "jaeger";
-  private ReportableEntityHandler<Span, String> mockTraceHandler =
+  private ReportableEntityHandler<Span> mockTraceHandler =
       MockReportableEntityHandlerFactory.getMockTraceHandler();
-  private ReportableEntityHandler<SpanLogs, String> mockTraceLogsHandler =
+  private ReportableEntityHandler<SpanLogs> mockTraceLogsHandler =
       MockReportableEntityHandlerFactory.getMockTraceSpanLogsHandler();
   private long startTime = System.currentTimeMillis();
 

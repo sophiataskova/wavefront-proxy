@@ -18,11 +18,11 @@ import com.yammer.metrics.core.MetricName;
 import com.yammer.metrics.core.MetricsRegistry;
 import com.yammer.metrics.core.WavefrontHistogram;
 
-import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.logging.Logger;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -38,6 +38,7 @@ import javax.annotation.Nullable;
  * @author Mori Bellamy (mori@wavefront.com)
  */
 public class EvictingMetricsRegistry {
+  protected static final Logger logger = Logger.getLogger(EvictingMetricsRegistry.class.getCanonicalName());
   private final MetricsRegistry metricsRegistry;
   private final Cache<MetricName, Metric> metricCache;
   private final LoadingCache<MetricMatcher, Set<MetricName>> metricNamesForMetricMatchers;
@@ -70,7 +71,7 @@ public class EvictingMetricsRegistry {
           }
         })
         .build();
-    this.metricNamesForMetricMatchers = Caffeine.newBuilder()
+    this.metricNamesForMetricMatchers = Caffeine.<MetricMatcher, Set<MetricName>>newBuilder()
         .build((metricMatcher) -> Sets.newHashSet());
   }
 
@@ -98,7 +99,7 @@ public class EvictingMetricsRegistry {
   }
 
   public synchronized void evict(MetricMatcher evicted) {
-    for (MetricName toRemove : Objects.requireNonNull(metricNamesForMetricMatchers.get(evicted))) {
+    for (MetricName toRemove : metricNamesForMetricMatchers.get(evicted)) {
       metricCache.invalidate(toRemove);
     }
     metricNamesForMetricMatchers.invalidate(evicted);
@@ -113,7 +114,7 @@ public class EvictingMetricsRegistry {
                                    Function<MetricName, M> getter) {
     @Nullable
     Metric cached = metricCache.getIfPresent(metricName);
-    Objects.requireNonNull(metricNamesForMetricMatchers.get(metricMatcher)).add(metricName);
+    metricNamesForMetricMatchers.get(metricMatcher).add(metricName);
     if (cached != null && cached == metricsRegistry.allMetrics().get(metricName)) {
       return (M) cached;
     }

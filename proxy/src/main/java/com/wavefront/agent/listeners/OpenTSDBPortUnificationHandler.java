@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.wavefront.agent.auth.TokenAuthenticator;
+import com.wavefront.agent.channel.ChannelUtils;
 import com.wavefront.agent.channel.HealthCheckManager;
 import com.wavefront.agent.handlers.ReportableEntityHandler;
 import com.wavefront.agent.handlers.ReportableEntityHandlerFactory;
@@ -16,12 +17,12 @@ import com.wavefront.metrics.JsonMetricsParser;
 
 import java.net.InetAddress;
 import java.net.URI;
-import java.net.URISyntaxException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.ResourceBundle;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.logging.Logger;
 
 import javax.annotation.Nullable;
 
@@ -32,8 +33,8 @@ import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.util.CharsetUtil;
 import wavefront.report.ReportPoint;
 
-import static com.wavefront.agent.channel.ChannelUtils.getRemoteAddress;
-import static com.wavefront.agent.channel.ChannelUtils.errorMessageWithRootCause;
+import static com.wavefront.agent.channel.CachingHostnameLookupResolver.getRemoteAddress;
+import static com.wavefront.agent.channel.ChannelUtils.writeExceptionText;
 import static com.wavefront.agent.channel.ChannelUtils.writeHttpResponse;
 
 /**
@@ -42,11 +43,14 @@ import static com.wavefront.agent.channel.ChannelUtils.writeHttpResponse;
  * @author Mike McLaughlin (mike@wavefront.com)
  */
 public class OpenTSDBPortUnificationHandler extends AbstractPortUnificationHandler {
+  private static final Logger logger = Logger.getLogger(
+      OpenTSDBPortUnificationHandler.class.getCanonicalName());
+
   /**
    * The point handler that takes report metrics one data point at a time and handles batching
    * and retries, etc
    */
-  private final ReportableEntityHandler<ReportPoint, String> pointHandler;
+  private final ReportableEntityHandler<ReportPoint> pointHandler;
 
   /**
    * OpenTSDB decoder object
@@ -59,6 +63,7 @@ public class OpenTSDBPortUnificationHandler extends AbstractPortUnificationHandl
   @Nullable
   private final Function<InetAddress, String> resolver;
 
+  @SuppressWarnings("unchecked")
   public OpenTSDBPortUnificationHandler(
       final String handle, final TokenAuthenticator tokenAuthenticator,
       final HealthCheckManager healthCheckManager,
@@ -75,9 +80,11 @@ public class OpenTSDBPortUnificationHandler extends AbstractPortUnificationHandl
 
   @Override
   protected void handleHttpMessage(final ChannelHandlerContext ctx,
-                                   final FullHttpRequest request) throws URISyntaxException {
+                                   final FullHttpRequest request) {
     StringBuilder output = new StringBuilder();
-    URI uri = new URI(request.uri());
+    URI uri = ChannelUtils.parseUri(ctx, request);
+    if (uri == null) return;
+
     switch (uri.getPath()) {
       case "/api/put":
         final ObjectMapper jsonTree = new ObjectMapper();
@@ -100,7 +107,7 @@ public class OpenTSDBPortUnificationHandler extends AbstractPortUnificationHandl
           }
         } catch (Exception e) {
           status = HttpResponseStatus.BAD_REQUEST;
-          output.append(errorMessageWithRootCause(e));
+          writeExceptionText(e, output);
           logWarning("WF-300: Failed to handle /api/put request", e, ctx);
         }
         writeHttpResponse(ctx, status, output, request);
@@ -122,14 +129,14 @@ public class OpenTSDBPortUnificationHandler extends AbstractPortUnificationHandl
    * Handles an incoming plain text (string) message.
    */
   protected void handlePlainTextMessage(final ChannelHandlerContext ctx,
-                                        String message) {
+                                        String message) throws Exception {
     if (message == null) {
       throw new IllegalArgumentException("Message cannot be null");
     }
     if (message.startsWith("version")) {
       ChannelFuture f = ctx.writeAndFlush("Wavefront OpenTSDB Endpoint\n");
       if (!f.isSuccess()) {
-        throw new RuntimeException("Failed to write version response", f.cause());
+        throw new Exception("Failed to write version response", f.cause());
       }
     } else {
       WavefrontPortUnificationHandler.preprocessAndHandlePoint(message, decoder, pointHandler,

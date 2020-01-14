@@ -7,9 +7,9 @@ import com.yammer.metrics.core.MetricName;
 
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.Properties;
 import java.util.function.Function;
-import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -23,7 +23,11 @@ import javax.annotation.Nullable;
 public class ReportableConfig {
   private static final Logger logger = Logger.getLogger(ReportableConfig.class.getCanonicalName());
 
-  private final Properties prop = new Properties();
+  private Properties prop = new Properties();
+
+  public ReportableConfig(InputStream stream) throws IOException {
+    prop.load(stream);
+  }
 
   public ReportableConfig(String fileName) throws IOException {
     prop.load(new FileInputStream(fileName));
@@ -40,18 +44,6 @@ public class ReportableConfig {
     return prop.getProperty(key, defaultValue);
   }
 
-  public int getInteger(String key, Number defaultValue) {
-    return getNumber(key, defaultValue).intValue();
-  }
-
-  public long getLong(String key, Number defaultValue) {
-    return getNumber(key, defaultValue).longValue();
-  }
-
-  public double getDouble(String key, Number defaultValue) {
-    return getNumber(key, defaultValue).doubleValue();
-  }
-
   public Number getNumber(String key, Number defaultValue) {
     return getNumber(key, defaultValue, null, null);
   }
@@ -60,27 +52,26 @@ public class ReportableConfig {
                           @Nullable Number clampMaxValue) {
     String property = prop.getProperty(key);
     if (property == null && defaultValue == null) return null;
-    double d;
+    Long l;
     try {
-      d = property == null ? defaultValue.doubleValue() : Double.parseDouble(property.trim());
+      l = property == null ? defaultValue.longValue() : Long.parseLong(property.trim());
     } catch (NumberFormatException e) {
-      throw new NumberFormatException("Config setting \"" + key + "\": invalid number format \"" +
-          property + "\"");
+      throw new NumberFormatException("Config setting \"" + key + "\": invalid number format \"" + property + "\"");
     }
-    if (clampMinValue != null && d < clampMinValue.longValue()) {
-      logger.log(Level.WARNING, key + " (" + d + ") is less than " + clampMinValue +
+    if (clampMinValue != null && l < clampMinValue.longValue()) {
+      logger.log(Level.WARNING, key + " (" + l + ") is less than " + clampMinValue +
           ", will default to " + clampMinValue);
       reportGauge(clampMinValue, new MetricName("config", "", key));
       return clampMinValue;
     }
-    if (clampMaxValue != null && d > clampMaxValue.longValue()) {
-      logger.log(Level.WARNING, key + " (" + d + ") is greater than " + clampMaxValue +
+    if (clampMaxValue != null && l > clampMaxValue.longValue()) {
+      logger.log(Level.WARNING, key + " (" + l + ") is greater than " + clampMaxValue +
           ", will default to " + clampMaxValue);
       reportGauge(clampMaxValue, new MetricName("config", "", key));
       return clampMaxValue;
     }
-    reportGauge(d, new MetricName("config", "", key));
-    return d;
+    reportGauge(l, new MetricName("config", "", key));
+    return l;
   }
 
   public String getString(String key, String defaultValue) {
@@ -108,22 +99,11 @@ public class ReportableConfig {
     return prop.getProperty(key) != null;
   }
 
-  public static void reportSettingAsGauge(Supplier<Number> numberSupplier, String key) {
-    reportGauge(numberSupplier, new MetricName("config", "", key));
+  public void reportSettingAsGauge(Number number, String key) {
+    reportGauge(number, new MetricName("config", "", key));
   }
 
-  public static void reportGauge(Supplier<Number> numberSupplier, MetricName metricName) {
-    Metrics.newGauge(metricName,
-        new Gauge<Double>() {
-          @Override
-          public Double value() {
-            return numberSupplier.get().doubleValue();
-          }
-        }
-    );
-  }
-
-  public static void reportGauge(Number number, MetricName metricName) {
+  public void reportGauge(Number number, MetricName metricName) {
     Metrics.newGauge(metricName,
         new Gauge<Double>() {
           @Override
